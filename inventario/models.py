@@ -18,6 +18,13 @@ class Insumo(models.Model):
     stock_minimo = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     costo_unitario = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     proveedor = models.ForeignKey(Proveedor, on_delete=models.PROTECT, related_name="insumos")
+    bodega = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="insumos",
+        null=True,
+        blank=True,
+    )
     estado = models.CharField(max_length=20, default="OK")
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)
@@ -37,16 +44,9 @@ class Producto(models.Model):
     nombre = models.CharField(max_length=150)
     descripcion = models.TextField(blank=True)
 
-    # Relación con receta base (plantilla de insumos)
-    receta = models.ForeignKey(
-        "Receta",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="productos"
-    )
+    # 👇 ya NO debe haber este campo:
+    # receta = models.ForeignKey("Receta", ...)
 
-    # Atributos (se copiarán desde la receta si se selecciona una)
     tela = models.CharField(max_length=100, blank=True)
     color = models.CharField(max_length=100, blank=True)
     talla = models.CharField(max_length=50, blank=True)
@@ -59,11 +59,28 @@ class Producto(models.Model):
         return f"{self.codigo} - {self.nombre}"
         
 class Receta(models.Model):
-    codigo = models.CharField(max_length=50, unique=True)  # ID de la receta
+    codigo = models.CharField(max_length=50, unique=True)
     nombre = models.CharField(max_length=150)
     descripcion = models.TextField(blank=True)
 
-    # Atributos opcionales, igual que producto
+    # 👇 NUEVO: relación correcta
+    producto = models.ForeignKey(
+        Producto,
+        on_delete=models.CASCADE,
+        related_name="recetas",
+        null=True,
+        blank=True,
+    )
+    bodega = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="recetas",
+        null=True,
+        blank=True,
+    )
+
+
+    # Atributos opcionales (pueden seguir existiendo aunque no los uses en UI)
     tela = models.CharField(max_length=100, blank=True)
     color = models.CharField(max_length=100, blank=True)
     talla = models.CharField(max_length=50, blank=True)
@@ -102,5 +119,25 @@ class Produccion(models.Model):
     cantidad = models.PositiveIntegerField()
     creado_en = models.DateTimeField(auto_now_add=True)
 
+    bodega = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="producciones",
+        null=True,
+        blank=True,
+    )
+
     def __str__(self):
         return f"{self.receta} x {self.cantidad} ({self.creado_en:%Y-%m-%d %H:%M})"
+
+class Bodega(models.Model):
+    codigo = models.CharField(max_length=50, unique=True)
+    nombre = models.CharField(max_length=100)
+    descripcion = models.TextField(blank=True)
+    ubicacion = models.CharField(max_length=200, blank=True)
+
+    creado_en = models.DateTimeField(auto_now_add=True)
+    actualizado_en = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.codigo} - {self.nombre}"
