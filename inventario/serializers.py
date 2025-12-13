@@ -1,5 +1,9 @@
 from rest_framework import serializers
-from .models import Insumo, Proveedor, Producto, Receta, RecetaItem, Produccion, Bodega
+from .models import (
+    Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
+    Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble
+)
+from .services.pricing import calculate_product_prices
 
 
 class ProveedorSerializer(serializers.ModelSerializer):
@@ -7,33 +11,190 @@ class ProveedorSerializer(serializers.ModelSerializer):
         model = Proveedor
         fields = ["id", "nombre"]
 
-class BodegaSerializer(serializers.ModelSerializer):
-    # estos campos los llenaremos desde la vista con annotate
-    insumos_count = serializers.IntegerField(read_only=True)
-    recetas_count = serializers.IntegerField(read_only=True)
 
+class BodegaSerializer(serializers.ModelSerializer):
     class Meta:
         model = Bodega
         fields = [
-            "id",
-            "codigo",
-            "nombre",
-            "descripcion",
-            "ubicacion",
-            "creado_en",
-            "actualizado_en",
-            "insumos_count",
-            "recetas_count",
+            "id", "codigo", "nombre", "descripcion", "ubicacion",
+            "creado_en", "actualizado_en"
         ]
 
-class InsumoSerializer(serializers.ModelSerializer):
-    # Para lectura: objeto proveedor completo
-    proveedor = ProveedorSerializer(read_only=True)
 
-    # Para escritura: solo el id del proveedor
+class TerceroSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tercero
+        fields = ["id", "codigo", "nombre"]
+
+
+class ImpuestoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Impuesto
+        fields = ["id", "nombre", "codigo", "valor"]
+
+
+class PrecioProductoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PrecioProducto
+        fields = ["id", "nombre", "valor", "es_descuento"]
+
+
+class DatosAdicionalesProductoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DatosAdicionalesProducto
+        fields = [
+            "referencia", "unidad",
+            "stock",  "stock_minimo", "descripcion",
+            "marca", "modelo", "codigo_arancelario"
+        ]
+
+
+class ProductoSerializer(serializers.ModelSerializer):
+    price_breakdown = serializers.SerializerMethodField(read_only=True)
+    impuestos = ImpuestoSerializer(many=True, read_only=True)
+    impuesto_ids = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Impuesto.objects.all(),
+        source="impuestos",
+        write_only=True,
+        required=False
+    )
+
+    tercero = TerceroSerializer(read_only=True)
+    tercero_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tercero.objects.all(),
+        source="tercero",
+        write_only=True,
+        required=False,
+        allow_null=True
+    )
+
+    precios = PrecioProductoSerializer(many=True, read_only=True)
+    datos_adicionales = DatosAdicionalesProductoSerializer(read_only=True)
+
+    subtotal_sin_impuestos = serializers.SerializerMethodField(read_only=True)
+    precio_total = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = Producto
+        fields = [
+            "codigo_sku",
+            "nombre",
+            "codigo_barras",
+            "unidad_medida",
+            "tercero",
+            "tercero_id",
+            "impuestos",
+            "impuesto_ids",
+            "precios",
+            "datos_adicionales",
+            "price_breakdown",
+            "subtotal_sin_impuestos",
+            "precio_total",
+            "creado_en",
+            "actualizado_en",
+        ]
+
+    def get_subtotal_sin_impuestos(self, obj):
+        return str(obj.subtotal_sin_impuestos or 0)
+
+    def get_precio_total(self, obj):
+        return str(obj.precio_total or 0)
+    
+    def get_price_breakdown(self, obj):
+        return calculate_product_prices(obj)
+
+
+class ProductoPrecioWriteSerializer(serializers.ModelSerializer):
+    """
+    Para crear/editar precios desde un endpoint dedicado.
+    """
+    class Meta:
+        model = PrecioProducto
+        fields = ["id", "producto", "nombre", "valor", "es_descuento"]
+
+
+class DatosAdicionalesWriteSerializer(serializers.ModelSerializer):
+    """
+    Para crear/editar datos adicionales desde endpoint dedicado.
+    """
+    class Meta:
+        model = DatosAdicionalesProducto
+        fields = [
+            "id", "producto", "referencia", "unidad", 
+            "stock", "stock_minimo",
+            "descripcion", "marca", "modelo", "codigo_arancelario"
+        ]
+
+
+class InsumoSerializer(serializers.ModelSerializer):
+    bodega = BodegaSerializer(read_only=True)
+    bodega_id = serializers.PrimaryKeyRelatedField(
+        queryset=Bodega.objects.all(),
+        source="bodega",
+        write_only=True
+    )
+
+    proveedor = ProveedorSerializer(read_only=True)
     proveedor_id = serializers.PrimaryKeyRelatedField(
         queryset=Proveedor.objects.all(),
         source="proveedor",
+        write_only=True,
+        required=False,
+        allow_null=True
+    )
+
+    tercero = TerceroSerializer(read_only=True)   # 👈 NUEVO
+    tercero_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tercero.objects.all(),
+        source="tercero",
+        write_only=True,
+        required=False,
+        allow_null=True
+    )
+
+    class Meta:
+        model = Insumo
+        fields = [
+            "codigo",
+            "nombre",
+            "descripcion",
+            "referencia",
+            "bodega",
+            "bodega_id",
+            "tercero",  
+            "tercero_id", 
+            "cantidad",
+            "stock_minimo",
+            "costo_unitario",
+            "proveedor",
+            "proveedor_id",
+            "creado_en",
+            "actualizado_en",
+        ]
+
+    def validate(self, attrs):
+        # si referencia no viene, usar el código (pk)
+        referencia = attrs.get("referencia")
+        codigo = attrs.get("codigo") or getattr(self.instance, "codigo", None)
+
+        if not referencia:
+            attrs["referencia"] = codigo
+
+        return attrs
+
+
+class TallaSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Talla
+        fields = ["id", "nombre"]
+
+
+class NotaEnsambleSerializer(serializers.ModelSerializer):
+    producto = ProductoSerializer(read_only=True)
+    producto_id = serializers.PrimaryKeyRelatedField(
+        queryset=Producto.objects.all(),
+        source="producto",
         write_only=True
     )
 
@@ -41,184 +202,40 @@ class InsumoSerializer(serializers.ModelSerializer):
     bodega_id = serializers.PrimaryKeyRelatedField(
         queryset=Bodega.objects.all(),
         source="bodega",
+        write_only=True
+    )
+
+    talla = TallaSerializer(read_only=True)
+    talla_id = serializers.PrimaryKeyRelatedField(
+        queryset=Talla.objects.all(),
+        source="talla",
         write_only=True,
         required=False,
-        allow_null=True,
+        allow_null=True
+    )
+
+    tercero = TerceroSerializer(read_only=True)
+    tercero_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tercero.objects.all(),
+        source="tercero",
+        write_only=True
     )
 
     class Meta:
-        model = Insumo
+        model = NotaEnsamble
         fields = [
             "id",
-            "codigo", 
-            "nombre",
-            "unidad",
-            "color",         
-            "descripcion",
-            "stock_actual",
-            "stock_minimo",
-            "costo_unitario",
-            "proveedor",      # read-only (objeto)
-            "proveedor_id",   # write-only (id)
-            "bodega",        # read-only 👈
-            "bodega_id",     # write-only 👈
-            "estado",
-            "creado_en",
-            "actualizado_en",
-        ]
-    def _generate_codigo(self):
-        last = Insumo.objects.order_by("-id").first()
-        next_num = (last.id if last else 0) + 1
-        return f"INS-{next_num:04d}"
-
-    def create(self, validated_data):
-        # Si no viene código, lo generamos
-        if not validated_data.get("codigo"):
-            validated_data["codigo"] = self._generate_codigo()
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        # Permite editar el código si quieres (opcional)
-        return super().update(instance, validated_data)
-
-
-class RecetaItemSerializer(serializers.ModelSerializer):
-    insumo = InsumoSerializer(read_only=True)
-    insumo_id = serializers.PrimaryKeyRelatedField(
-        queryset=Insumo.objects.all(),
-        source="insumo",
-        write_only=True,
-    )
-    costo_total = serializers.SerializerMethodField(read_only=True)
-
-    class Meta:
-        model = RecetaItem
-        fields = [
-            "id",
-            "insumo",
-            "insumo_id",
+            "producto",
+            "producto_id",
+            "bodega",
+            "bodega_id",
             "cantidad",
-            "unidad",
-            "costo_unitario",
-            "costo_total",
-        ]
-
-    def get_costo_total(self, obj):
-        return float(obj.costo_total)
-
-class ProductoSerializer(serializers.ModelSerializer):
-    # opcional: receta principal solo lectura
-
-    class Meta:
-        model = Producto
-        fields = [
-            "id",
-            "codigo",
-            "nombre",
-            "descripcion",
-            "tela",
-            "color",
             "talla",
-            "marca",
-            "creado_en",
-            "actualizado_en",
-        ]
-
-    def get_receta(self, obj):
-        receta = obj.recetas.order_by("id").first()
-        if not receta:
-            return None
-        return RecetaSerializer(receta).data
-
-class ProduccionSerializer(serializers.ModelSerializer):
-    receta_nombre = serializers.CharField(source="receta.nombre", read_only=True)
-    receta_codigo = serializers.CharField(source="receta.codigo", read_only=True)
-
-    bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
-    bodega_codigo = serializers.CharField(source="bodega.codigo", read_only=True)
-
-    class Meta:
-        model = Produccion
-        fields = [
-            "id",
-            "receta",
-            "receta_nombre",
-            "receta_codigo",
-            "bodega_codigo",
-            "bodega_nombre",
-            "cantidad",
+            "talla_id",
+            "observaciones",
+            "tercero",
+            "tercero_id",
+            "fecha_elaboracion",
             "creado_en",
         ]
         read_only_fields = ["id", "creado_en"]
-
-    def get_bodega_nombre(self, obj):
-        bodega = getattr(obj.receta, "bodega", None)
-        return bodega.nombre if bodega else None
-
-    def get_bodega_codigo(self, obj):
-        bodega = getattr(obj.receta, "bodega", None)
-        return bodega.codigo if bodega else None
-
-class RecetaSerializer(serializers.ModelSerializer):
-    items = RecetaItemSerializer(many=True)
-    # lectura: producto anidado
-    producto = ProductoSerializer(read_only=True)
-    # escritura: solo id
-    producto_id = serializers.PrimaryKeyRelatedField(
-        queryset=Producto.objects.all(),
-        source="producto",
-        write_only=True,
-        required=False,
-        allow_null=True,
-    )
-
-    bodega = BodegaSerializer(read_only=True)
-    bodega_id = serializers.PrimaryKeyRelatedField(
-        queryset=Bodega.objects.all(),
-        source="bodega",
-        write_only=True,
-        required=False,
-        allow_null=True,
-    )
-
-    class Meta:
-        model = Receta
-        fields = [
-            "id",
-            "codigo",
-            "nombre",
-            "descripcion",
-            "tela",
-            "color",
-            "talla",
-            "marca",
-            "producto",      # read-only
-            "producto_id",   # write-only
-            "bodega",      # read-only
-            "bodega_id",   # write-only
-            "items",
-            "creado_en",
-            "actualizado_en",
-        ]
-
-    def create(self, validated_data):
-        items_data = validated_data.pop("items", [])
-        receta = Receta.objects.create(**validated_data)
-        for item in items_data:
-            RecetaItem.objects.create(receta=receta, **item)
-        return receta
-
-    def update(self, instance, validated_data):
-        items_data = validated_data.pop("items", None)
-
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-
-        if items_data is not None:
-            instance.items.all().delete()
-            for item in items_data:
-                RecetaItem.objects.create(receta=instance, **item)
-
-        return instance
-

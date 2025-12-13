@@ -11,19 +11,12 @@ class ProveedorAdmin(admin.ModelAdmin):
 @admin.register(Insumo)
 class InsumoAdmin(admin.ModelAdmin):
     list_display = (
-        "id",
+        "codigo",
         "nombre",
-        "unidad",
-        "stock_actual",
-        "stock_minimo",
+        "referencia",
+        "bodega",
+        "cantidad",
         "costo_unitario",
-        "proveedor",
-        "estado_display",
     )
-    list_filter = ("unidad", "proveedor")
-    search_fields = ("nombre",)
-
-    def estado_display(self, obj):
-        return "Bajo mínimo" if obj.estado == "BAJO_MINIMO" else "OK"
-
-    estado_display.short_description = "Estado"
+    search_fields = ("codigo", "nombre", "referencia")
+    list_filter = ("bodega",)
