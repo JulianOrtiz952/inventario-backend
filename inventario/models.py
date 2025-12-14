@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from decimal import Decimal
+from django.core.exceptions import ValidationError
 
 class Proveedor(models.Model):
     nombre = models.CharField(max_length=100)
@@ -196,39 +197,67 @@ class Insumo(models.Model):
 
 
 class NotaEnsamble(models.Model):
-    # ✅ id autoincremental por defecto
-    producto = models.ForeignKey(
-        Producto,
-        on_delete=models.PROTECT,
-        related_name="notas_ensamble"
-    )
-    bodega = models.ForeignKey(
-        Bodega,
-        on_delete=models.PROTECT,
-        related_name="notas_ensamble"
-    )
-    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=0)
-
-    talla = models.ForeignKey(
-        Talla,
-        on_delete=models.PROTECT,
-        related_name="notas_ensamble",
-        null=True,
-        blank=True,
-    )
-
+    bodega = models.ForeignKey("Bodega", on_delete=models.PROTECT, related_name="notas_ensamble")
+    tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT, null=True, blank=True, related_name="notas_ensamble")
+    fecha_elaboracion = models.DateField(default=timezone.now)
     observaciones = models.TextField(null=True, blank=True)
 
-    tercero = models.ForeignKey(
-        Tercero,
-        on_delete=models.PROTECT,
-        related_name="notas_ensamble"
-    )
-
-    # ✅ solo fecha; si no viene, hoy
-    fecha_elaboracion = models.DateField(default=timezone.localdate)
-
     creado_en = models.DateTimeField(auto_now_add=True)
+    actualizado_en = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"NotaEnsamble #{self.id} - {self.producto.codigo_sku}"
+        return f"NotaEns#{self.id}"
+
+
+class NotaEnsambleDetalle(models.Model):
+    nota = models.ForeignKey(NotaEnsamble, on_delete=models.CASCADE, related_name="detalles")
+    producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="ensambles_detalle")
+    talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="ensambles_detalle")
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+
+    class Meta:
+        unique_together = ("nota", "producto", "talla")
+
+class ProductoInsumo(models.Model):
+    """
+    Relación Producto -> Insumo (BOM/Receta)
+    Indica cuánto insumo se consume por cada 1 unidad del producto.
+    """
+    producto = models.ForeignKey(
+        "Producto",
+        on_delete=models.CASCADE,
+        related_name="bom_insumos",
+    )
+    insumo = models.ForeignKey(
+        "Insumo",
+        on_delete=models.PROTECT,
+        related_name="usado_en_productos",
+    )
+    cantidad_por_unidad = models.DecimalField(max_digits=12, decimal_places=6, default=0)
+    # opcional: merma/porcentaje extra
+    merma_porcentaje = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+
+    class Meta:
+        unique_together = ("producto", "insumo")
+        verbose_name = "Insumo por Producto (BOM)"
+        verbose_name_plural = "Insumos por Producto (BOM)"
+
+    def clean(self):
+        if self.cantidad_por_unidad is None or self.cantidad_por_unidad <= Decimal("0"):
+            raise ValidationError({"cantidad_por_unidad": "Debe ser mayor que 0."})
+        if self.merma_porcentaje is None or self.merma_porcentaje < Decimal("0"):
+            raise ValidationError({"merma_porcentaje": "No puede ser negativa."})
+
+        # regla recomendada: receta debe usar insumos de la misma bodega del ensamble
+        # (no lo validamos aquí porque la bodega está en la Nota de Ensamble, no en producto)
+
+    def __str__(self):
+        return f"{self.producto} -> {self.insumo} ({self.cantidad_por_unidad})"
+
+class NotaEnsambleInsumo(models.Model):
+    nota = models.ForeignKey(NotaEnsamble, on_delete=models.CASCADE, related_name="insumos")
+    insumo = models.ForeignKey("Insumo", on_delete=models.PROTECT, related_name="ensambles_insumo")
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+
+    class Meta:
+        unique_together = ("nota", "insumo")
