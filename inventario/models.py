@@ -209,14 +209,14 @@ class NotaEnsamble(models.Model):
         return f"NotaEns#{self.id}"
 
 
-class NotaEnsambleDetalle(models.Model):
-    nota = models.ForeignKey(NotaEnsamble, on_delete=models.CASCADE, related_name="detalles")
-    producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="ensambles_detalle")
-    talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="ensambles_detalle")
-    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
-
-    class Meta:
-        unique_together = ("nota", "producto", "talla")
+#class NotaEnsambleDetalle(models.Model):
+#    nota = models.ForeignKey(NotaEnsamble, on_delete=models.CASCADE, related_name="detalles")
+#    producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="ensambles_detalle")
+#    talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="ensambles_detalle")
+#    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+#
+#    class Meta:
+#        unique_together = ("nota", "producto", "talla")
 
 class ProductoInsumo(models.Model):
     """
@@ -261,3 +261,76 @@ class NotaEnsambleInsumo(models.Model):
 
     class Meta:
         unique_together = ("nota", "insumo")
+
+class NotaEnsambleDetalle(models.Model):
+    nota = models.ForeignKey(NotaEnsamble, on_delete=models.CASCADE, related_name="detalles")
+    producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="ensambles_detalle")
+    talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="ensambles_detalle")
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+
+    bodega_actual = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="productos_detalle",
+        null=True,
+        blank=True
+    )
+
+    class Meta:
+        unique_together = ("nota", "producto", "talla", "bodega_actual")
+
+    def save(self, *args, **kwargs):
+        # si no viene bodega_actual, por defecto es la bodega de la nota
+        if self.bodega_actual_id is None and self.nota_id is not None:
+            self.bodega_actual = self.nota.bodega
+        super().save(*args, **kwargs)
+
+# models.py
+class TrasladoProducto(models.Model):
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    tercero = models.ForeignKey(
+        "Tercero",
+        on_delete=models.PROTECT,
+        related_name="traslados_producto"
+    )
+
+    bodega_origen = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="traslados_salida"
+    )
+
+    bodega_destino = models.ForeignKey(
+        "Bodega",
+        on_delete=models.PROTECT,
+        related_name="traslados_entrada"
+    )
+
+    producto = models.ForeignKey(
+        "Producto",
+        on_delete=models.PROTECT,
+        related_name="traslados"
+    )
+
+    talla = models.ForeignKey(
+        "Talla",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="traslados"
+    )
+
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+
+    # Para “no perder vínculo con la nota”: guardamos referencia al detalle original
+    detalle = models.ForeignKey(
+        "NotaEnsambleDetalle",
+        on_delete=models.PROTECT,
+        related_name="traslados",
+        null=True,
+        blank=True
+    )
+
+    def __str__(self):
+        return f"Traslado {self.id} {self.producto_id} {self.cantidad} {self.bodega_origen_id}->{self.bodega_destino_id}"

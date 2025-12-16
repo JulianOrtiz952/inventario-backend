@@ -48,7 +48,9 @@ INSTALLED_APPS = [
 REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",  # más adelante puedes poner IsAuthenticated
-    ]
+    ],
+    "DEFAULT_PAGINATION_CLASS": "inventario.pagination.Default30Pagination",
+    "PAGE_SIZE": 30,
 }
 
 MIDDLEWARE = [

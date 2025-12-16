@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble,
-    ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo
+    ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto
 )
 from django.db import transaction
 from .services.pricing import calculate_product_prices
@@ -16,10 +16,14 @@ class ProveedorSerializer(serializers.ModelSerializer):
 
 
 class BodegaSerializer(serializers.ModelSerializer):
+    insumos_count = serializers.IntegerField(read_only=True)
+    productos_count = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = Bodega
         fields = [
             "id", "codigo", "nombre", "descripcion", "ubicacion",
+            "insumos_count", "productos_count",
             "creado_en", "actualizado_en"
         ]
 
@@ -43,13 +47,42 @@ class PrecioProductoSerializer(serializers.ModelSerializer):
 
 
 class DatosAdicionalesProductoSerializer(serializers.ModelSerializer):
+
+    id = serializers.IntegerField(read_only=True)
+    producto_id = serializers.PrimaryKeyRelatedField(queryset=Producto.objects.all(), source="producto", write_only=True)
     class Meta:
         model = DatosAdicionalesProducto
         fields = [
-            "referencia", "unidad",
-            "stock", "stock_minimo", "descripcion",
-            "marca", "modelo", "codigo_arancelario"
+            "id",
+            "producto",       # 👈 para leer
+            "producto_id",    # 👈 para escribir
+            "referencia",
+            "unidad",
+            "stock",
+            "stock_minimo",
+            "descripcion",
+            "marca",
+            "modelo",
+            "codigo_arancelario",
         ]
+
+    def create(self, validated_data):
+        producto_id = validated_data.get('producto_id')
+        producto = Producto.objects.get(id=producto_id)
+        return DatosAdicionalesProducto.objects.create(producto=producto, **validated_data)
+
+    def update(self, instance, validated_data):
+        instance.referencia = validated_data.get('referencia', instance.referencia)
+        instance.unidad = validated_data.get('unidad', instance.unidad)
+        instance.stock = validated_data.get('stock', instance.stock)
+        instance.stock_minimo = validated_data.get('stock_minimo', instance.stock_minimo)
+        instance.descripcion = validated_data.get('descripcion', instance.descripcion)
+        instance.marca = validated_data.get('marca', instance.marca)
+        instance.modelo = validated_data.get('modelo', instance.modelo)
+        instance.codigo_arancelario = validated_data.get('codigo_arancelario', instance.codigo_arancelario)
+        instance.save()
+        return instance
+
 
 
 class ProductoSerializer(serializers.ModelSerializer):
@@ -327,3 +360,32 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
             NotaEnsambleInsumo.objects.bulk_create(insumo_objs)
 
         return nota
+
+class TrasladoProductoSerializer(serializers.ModelSerializer):
+    tercero = TerceroSerializer(read_only=True)
+    bodega_origen = BodegaSerializer(read_only=True)
+    bodega_destino = BodegaSerializer(read_only=True)
+
+    tercero_id = serializers.PrimaryKeyRelatedField(queryset=Tercero.objects.all(), source="tercero", write_only=True)
+    bodega_origen_id = serializers.PrimaryKeyRelatedField(queryset=Bodega.objects.all(), source="bodega_origen", write_only=True)
+    bodega_destino_id = serializers.PrimaryKeyRelatedField(queryset=Bodega.objects.all(), source="bodega_destino", write_only=True)
+
+    producto_id = serializers.PrimaryKeyRelatedField(queryset=Producto.objects.all(), source="producto", write_only=True)
+    talla_id = serializers.PrimaryKeyRelatedField(queryset=Talla.objects.all(), source="talla", required=False, allow_null=True, write_only=True)
+
+    producto = ProductoSerializer(read_only=True)
+    talla = TallaSerializer(read_only=True)
+
+    class Meta:
+        model = TrasladoProducto
+        fields = [
+            "id", "creado_en",
+            "tercero", "tercero_id",
+            "bodega_origen", "bodega_origen_id",
+            "bodega_destino", "bodega_destino_id",
+            "producto", "producto_id",
+            "talla", "talla_id",
+            "cantidad",
+            "detalle",
+        ]
+        read_only_fields = ["id", "creado_en", "detalle"]

@@ -5,7 +5,7 @@ from rest_framework.routers import DefaultRouter
 from inventario.views import (
     InsumoViewSet, ProveedorViewSet, ProductoViewSet, BodegaViewSet,
     ImpuestoViewSet, PrecioProductoViewSet, TerceroViewSet,
-    DatosAdicionalesProductoViewSet, TallaViewSet, NotaEnsambleViewSet, ProductoInsumoViewSet
+    DatosAdicionalesProductoViewSet, TallaViewSet, NotaEnsambleViewSet, ProductoInsumoViewSet, TrasladoProductoViewSet
 )
 
 router = DefaultRouter()
@@ -26,6 +26,8 @@ router.register(r"tallas", TallaViewSet, basename="talla")
 router.register(r"notas-ensamble", NotaEnsambleViewSet, basename="nota-ensamble")
 
 router.register(r"producto-insumos", ProductoInsumoViewSet, basename="producto-insumos")
+
+router.register(r"traslados-producto", TrasladoProductoViewSet, basename="traslados-producto")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

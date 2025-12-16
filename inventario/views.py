@@ -3,17 +3,23 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
+from rest_framework.decorators import action
+from django.db.models import Sum
+from django.db.models import Count
+from django.db.models import Q
+from django.db.models import F
+from django.db.models.functions import Coalesce
 
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla,
-    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo
+    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto
 )
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
     TerceroSerializer, DatosAdicionalesWriteSerializer,
-    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer
+    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer
 )
 
 def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
@@ -194,17 +200,14 @@ def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
         requerido = cantidad_producto * cpu * (Decimal("1") + (merma / Decimal("100")))
 
         insumo_ref = li.insumo
-        if getattr(insumo_ref, "bodega_id", None) and insumo_ref.bodega_id != bodega.id:
-            insumo_ref = Insumo.objects.filter(codigo=li.insumo.codigo, bodega=bodega).first()
-
         if not insumo_ref:
             insuficientes[li.insumo.codigo] = {
-                "insumo": getattr(li.insumo, "nombre", li.insumo.codigo),
-                "disponible": "0",
-                "requerido": str(abs(requerido)),
-                "faltante": str(abs(requerido)),
+            "insumo": getattr(li.insumo, "nombre", li.insumo.codigo),
+            "disponible": "0",
+            "requerido": str(abs(requerido)),
+            "faltante": str(abs(requerido)),
             }
-            continue
+        continue
 
         requeridos.append((insumo_ref, requerido))
 
@@ -296,9 +299,6 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
             cant_total = _d(ni.cantidad) * _d(total_productos) * signo
 
             ins = ni.insumo
-            # Si insumo está por bodega y no coincide, buscar mismo código en la bodega de la nota
-            if getattr(ins, "bodega_id", None) and ins.bodega_id != nota.bodega_id:
-                ins = Insumo.objects.filter(codigo=ni.insumo.codigo, bodega=nota.bodega).first()
 
             if not ins:
                 raise ValidationError({"detail": f"Insumo {ni.insumo.codigo} no existe en la bodega de la nota."})
@@ -366,6 +366,17 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         4) Aplicar TODO (lo nuevo)
         """
         nota = self.get_object()
+
+            # 🚫 Bloquear si hay detalles fuera de la bodega original de la nota
+        if nota.detalles.exclude(bodega_actual=nota.bodega).exists():
+            raise ValidationError({
+                "detail": (
+                    "Esta nota tiene productos trasladados a otra bodega. "
+                    "Para evitar inconsistencias, esta nota no se puede editar. "
+                    "Crea una nueva nota o revierte los traslados antes de editar."
+                ),
+                "code": "NOTA_CON_TRASLADOS"
+            })
 
         # 1) Revertir lo anterior (BOM/stock + manuales)
         self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"))
@@ -470,6 +481,72 @@ class BodegaViewSet(viewsets.ModelViewSet):
     queryset = Bodega.objects.all().order_by("nombre")
     serializer_class = BodegaSerializer
 
+    def get_queryset(self):
+        return (
+            Bodega.objects
+            .annotate(
+                insumos_count=Count("insumos", distinct=True),
+
+                # Cuenta productos distintos en los detalles cuya bodega efectiva sea esta bodega
+                productos_count=Count(
+                    "productos_detalle__producto",
+                    filter=Q(productos_detalle__cantidad__gt=0),
+                    distinct=True
+                )
+            )
+            .order_by("nombre")
+        )   
+
+    @action(detail=True, methods=["get"], url_path="contenido")
+    def contenido(self, request, pk=None):
+        bodega = self.get_object()
+
+        # ✅ Insumos de la bodega (tu Insumo tiene FK bodega) :contentReference[oaicite:1]{index=1}
+        insumos_qs = (
+            Insumo.objects
+            .filter(bodega=bodega)
+            .order_by("nombre")
+        )
+
+        insumos = []
+        for i in insumos_qs:
+            stock = i.cantidad or 0
+            cu = i.costo_unitario or 0
+            total = (stock * cu) if stock and cu else 0
+            insumos.append({
+                "codigo": i.codigo,
+                "nombre": i.nombre,
+                "stock_actual": str(stock),
+                "costo_unitario": str(cu),
+                "valor_total": str(total),
+            })
+
+        # ✅ Productos producidos en esa bodega:
+        # NotaEnsamble tiene FK bodega, y NotaEnsambleDetalle tiene producto + cantidad :contentReference[oaicite:2]{index=2}
+        productos_qs = (
+            NotaEnsambleDetalle.objects
+            .select_related("producto", "nota", "bodega_actual")
+            .annotate(bodega_efectiva=Coalesce("bodega_actual_id", "nota__bodega_id"))
+            .filter(bodega_efectiva=bodega.id)
+            .values("producto__codigo_sku", "producto__nombre")
+            .annotate(total_producido=Sum("cantidad"))
+            .order_by("producto__nombre")
+        )
+
+        productos = []
+        for p in productos_qs:
+            productos.append({
+                "codigo": p["producto__codigo_sku"],
+                "nombre": p["producto__nombre"],
+                "total_producido": str(p["total_producido"] or 0),
+            })
+
+        return Response({
+            "bodega": {"id": bodega.id, "codigo": bodega.codigo, "nombre": bodega.nombre},
+            "insumos": insumos,
+            "productos": productos,
+        })
+
 
 class TerceroViewSet(viewsets.ModelViewSet):
     queryset = Tercero.objects.all().order_by("codigo")
@@ -489,6 +566,49 @@ class ProductoViewSet(viewsets.ModelViewSet):
         .order_by("-creado_en")
     )
     serializer_class = ProductoSerializer
+
+    @action(detail=True, methods=["get"], url_path="stock-por-talla")
+    def stock_por_talla(self, request, pk=None):
+        producto = self.get_object()
+
+        bodega_id = request.query_params.get("bodega_id")
+        if bodega_id is not None and not str(bodega_id).isdigit():
+            raise ValidationError({"bodega_id": "Debe ser un entero."})
+
+        qs = (
+            NotaEnsambleDetalle.objects
+            .select_related("talla", "nota", "bodega_actual")
+            .filter(producto=producto)
+            .annotate(bodega_efectiva=Coalesce("bodega_actual_id", "nota__bodega_id"))
+        )
+
+        # ✅ si viene bodega_id, filtra por esa bodega
+        if bodega_id:
+            qs = qs.filter(bodega_efectiva=int(bodega_id))
+
+        items = (
+            qs.values("talla__id", "talla__nombre")
+            .annotate(cantidad=Sum("cantidad"))
+            .order_by("talla__nombre")
+        )
+
+        return Response({
+            "producto": {
+                "codigo": producto.codigo_sku,
+                "nombre": producto.nombre,
+            },
+            "bodega_id": int(bodega_id) if bodega_id else None,
+            "items": [
+                {
+                    "codigo": producto.codigo_sku,
+                    "nombre": producto.nombre,
+                    "talla_id": it["talla__id"],
+                    "talla": it["talla__nombre"] or "Sin talla",
+                    "cantidad": str(it["cantidad"] or 0),
+                }
+                for it in items
+            ],
+        })
 
 
 class PrecioProductoViewSet(viewsets.ModelViewSet):
@@ -521,3 +641,127 @@ class TallaViewSet(viewsets.ModelViewSet):
 class ProductoInsumoViewSet(viewsets.ModelViewSet):
     queryset = ProductoInsumo.objects.select_related("producto", "insumo").all()
     serializer_class = ProductoInsumoSerializer
+
+class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Historial de traslados (GET) y endpoint de ejecutar traslado (POST /traslados-producto/ejecutar/)
+    """
+    queryset = (
+        TrasladoProducto.objects
+        .select_related("tercero", "bodega_origen", "bodega_destino", "producto", "talla", "detalle")
+        .order_by("-id")
+    )
+    serializer_class = TrasladoProductoSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        bodega_id = self.request.query_params.get("bodega_id")
+        if bodega_id and str(bodega_id).isdigit():
+            bodega_id = int(bodega_id)
+            qs = qs.filter(
+                Q(bodega_origen_id=bodega_id) |
+                Q(bodega_destino_id=bodega_id)
+            )
+        return qs
+
+    @action(detail=False, methods=["post"], url_path="ejecutar")
+    @transaction.atomic
+    def ejecutar(self, request):
+        """
+        Payload:
+        {
+          "tercero_id": 1,
+          "bodega_origen_id": 2,
+          "bodega_destino_id": 3,
+          "producto_id": "SKU-001",
+          "talla_id": 5,          // opcional
+          "cantidad": "2.000"
+        }
+        """
+        ser = TrasladoProductoSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+
+        tercero = v["tercero"]
+        b_origen = v["bodega_origen"]
+        b_destino = v["bodega_destino"]
+        producto = v["producto"]
+        talla = v.get("talla", None)
+        cantidad = _d(v["cantidad"])
+
+        if b_origen.id == b_destino.id:
+            raise ValidationError({"bodega_destino_id": "La bodega destino debe ser diferente a la bodega origen."})
+
+        if cantidad <= 0:
+            raise ValidationError({"cantidad": "Debe ser mayor que 0."})
+
+        # Buscar detalles disponibles en la bodega origen (por bodega_actual; si null => nota.bodega)
+        qs = (
+            NotaEnsambleDetalle.objects
+            .select_related("nota", "nota__bodega", "bodega_actual")
+            .annotate(bodega_efectiva=Coalesce("bodega_actual_id", "nota__bodega_id"))
+            .filter(producto=producto)
+            .filter(bodega_efectiva=b_origen.id)
+            .order_by("nota__fecha_elaboracion", "id")
+        )
+
+        if talla is None:
+            qs = qs.filter(talla__isnull=True)
+        else:
+            qs = qs.filter(talla=talla)
+
+        disponible_total = sum(_d(x.cantidad) for x in qs)
+        if disponible_total < cantidad:
+            raise ValidationError({
+                "stock_insuficiente": {
+                    "disponible": str(disponible_total),
+                    "requerido": str(cantidad),
+                    "faltante": str(cantidad - disponible_total),
+                }
+            })
+
+        restante = cantidad
+
+        for det in qs:
+            if restante <= 0:
+                break
+
+            disponible_det = _d(det.cantidad)
+            mover = min(disponible_det, restante)
+            if mover <= 0:
+                continue
+
+            # 1) restar en origen (PERSISTIR)
+            nuevo_origen = disponible_det - mover
+            if nuevo_origen < 0:
+                raise ValidationError("Error interno: cantidad negativa tras traslado.")
+
+            det.cantidad = nuevo_origen
+            det.save(update_fields=["cantidad"])  # ✅ CLAVE: guardar la resta
+
+            # 2) sumar/crear en destino manteniendo MISMA nota
+            dest_det, _created = NotaEnsambleDetalle.objects.get_or_create(
+                nota=det.nota,
+                producto=det.producto,
+                talla=det.talla,
+                bodega_actual=b_destino,
+                defaults={"cantidad": Decimal("0")}
+            )
+            dest_det.cantidad = _d(dest_det.cantidad) + mover
+            dest_det.save(update_fields=["cantidad"])
+
+            # 3) historial
+            TrasladoProducto.objects.create(
+                tercero=tercero,
+                bodega_origen=b_origen,
+                bodega_destino=b_destino,
+                producto=producto,
+                talla=talla,
+                cantidad=mover,
+                detalle=det
+            )
+
+            restante -= mover
+
+
+        return Response({"ok": True, "cantidad_movida": str(cantidad)}, status=status.HTTP_200_OK)
