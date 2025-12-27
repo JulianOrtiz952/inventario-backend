@@ -2,11 +2,13 @@ from rest_framework import serializers
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble,
-    ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto
+    ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto,
+    NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock,
 )
 from django.db import transaction
 from .services.pricing import calculate_product_prices
 from decimal import Decimal
+from django.db.models import Q, Sum
 
 
 class ProveedorSerializer(serializers.ModelSerializer):
@@ -188,7 +190,8 @@ class InsumoSerializer(serializers.ModelSerializer):
         fields = [
             "codigo",
             "nombre",
-            "descripcion",
+            "observacion",
+            "factura",
             "referencia",
             "bodega",
             "bodega_id",
@@ -389,3 +392,136 @@ class TrasladoProductoSerializer(serializers.ModelSerializer):
             "detalle",
         ]
         read_only_fields = ["id", "creado_en", "detalle"]
+
+class NotaSalidaProductoDetalleInputSerializer(serializers.Serializer):
+    producto_id = serializers.CharField()
+    talla = serializers.CharField(required=False, allow_blank=True)
+    cantidad = serializers.DecimalField(max_digits=12, decimal_places=3)
+    costo_unitario = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, allow_null=True)
+
+    def validate_cantidad(self, v):
+        if v is None or v <= 0:
+            raise serializers.ValidationError("La cantidad debe ser mayor a 0.")
+        return v
+
+
+class NotaSalidaProductoDetalleSerializer(serializers.ModelSerializer):
+    producto = serializers.SerializerMethodField()
+    total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotaSalidaProductoDetalle
+        fields = ["id", "producto", "talla", "cantidad", "costo_unitario", "total", "creado_en"]
+
+    def get_producto(self, obj):
+        return {
+            "codigo_sku": obj.producto.codigo_sku,
+            "nombre": obj.producto.nombre,
+        }
+
+    def get_total(self, obj):
+        t = obj.total
+        return str(t) if t is not None else None
+
+
+class NotaSalidaAfectacionStockSerializer(serializers.ModelSerializer):
+    detalle_stock_id = serializers.IntegerField(source="detalle_stock.id", read_only=True)
+    nota_ensamble_id = serializers.IntegerField(source="detalle_stock.nota.id", read_only=True)
+
+    class Meta:
+        model = NotaSalidaAfectacionStock
+        fields = ["id", "detalle_stock_id", "nota_ensamble_id", "cantidad", "creado_en"]
+
+
+class NotaSalidaProductoSerializer(serializers.ModelSerializer):
+    bodega_id = serializers.PrimaryKeyRelatedField(queryset=Bodega.objects.all(), source="bodega", write_only=True)
+    tercero_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tercero.objects.all(), source="tercero", write_only=True, required=False, allow_null=True
+    )
+
+    bodega = serializers.SerializerMethodField(read_only=True)
+    tercero = serializers.SerializerMethodField(read_only=True)
+
+    detalles = NotaSalidaProductoDetalleSerializer(many=True, read_only=True)
+    detalles_input = NotaSalidaProductoDetalleInputSerializer(many=True, write_only=True)
+
+    class Meta:
+        model = NotaSalidaProducto
+        fields = [
+            "id", "numero", "fecha",
+            "bodega", "bodega_id",
+            "tercero", "tercero_id",
+            "observacion",
+            "detalles", "detalles_input",
+            "creado_en",
+        ]
+
+    def get_bodega(self, obj):
+        return {"id": obj.bodega.id, "codigo": obj.bodega.codigo, "nombre": obj.bodega.nombre}
+
+    def get_tercero(self, obj):
+        if not obj.tercero:
+            return None
+        return {"id": obj.tercero.id, "codigo": obj.tercero.codigo, "nombre": obj.tercero.nombre}
+
+    @transaction.atomic
+    def create(self, validated_data):
+        detalles_input = validated_data.pop("detalles_input", [])
+        salida = NotaSalidaProducto.objects.create(**validated_data)
+
+        # FIFO: descuenta de NotaEnsambleDetalle en la bodega efectiva
+        for d in detalles_input:
+            producto = Producto.objects.get(codigo_sku=d["producto_id"])
+            talla = (d.get("talla") or "").strip()
+            cantidad_req = d["cantidad"]
+
+            # stock en esa bodega: (bodega_actual=bodega) OR (bodega_actual NULL y nota.bodega=bodega)
+            bodega = salida.bodega
+
+            qs_stock = (
+                NotaEnsambleDetalle.objects
+                .select_for_update()
+                .filter(producto=producto, talla=talla)
+                .filter(
+                    Q(bodega_actual=bodega) |
+                    Q(bodega_actual__isnull=True, nota__bodega=bodega)
+                )
+                .order_by("nota__fecha_elaboracion", "id")
+            )
+
+            disponible = qs_stock.aggregate(s=Sum("cantidad"))["s"] or Decimal("0")
+            if disponible < cantidad_req:
+                raise serializers.ValidationError(
+                    f"Stock insuficiente para {producto.codigo_sku} talla '{talla or '-'}' en bodega {bodega.nombre}. "
+                    f"Disponible: {disponible}, requerido: {cantidad_req}"
+                )
+
+            det_salida = NotaSalidaProductoDetalle.objects.create(
+                salida=salida,
+                producto=producto,
+                talla=talla,
+                cantidad=cantidad_req,
+                costo_unitario=d.get("costo_unitario", None),
+            )
+
+            restante = cantidad_req
+            for stock_row in qs_stock:
+                if restante <= 0:
+                    break
+
+                tomar = min(restante, stock_row.cantidad)
+                if tomar <= 0:
+                    continue
+
+                stock_row.cantidad = (stock_row.cantidad - tomar)
+                stock_row.save(update_fields=["cantidad"])
+
+                NotaSalidaAfectacionStock.objects.create(
+                    salida_detalle=det_salida,
+                    detalle_stock=stock_row,
+                    cantidad=tomar,
+                )
+
+                restante -= tomar
+
+        return salida

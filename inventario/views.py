@@ -4,22 +4,23 @@ from rest_framework.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
 from rest_framework.decorators import action
-from django.db.models import Sum
-from django.db.models import Count
-from django.db.models import Q
-from django.db.models import F
+from django.db.models import Sum, Count, Q, F
 from django.db.models.functions import Coalesce
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla,
-    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto
+    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto, NotaSalidaProducto
 )
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
     TerceroSerializer, DatosAdicionalesWriteSerializer,
-    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer
+    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer, NotaSalidaProductoSerializer
 )
 
 def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
@@ -497,6 +498,48 @@ class BodegaViewSet(viewsets.ModelViewSet):
             .order_by("nombre")
         )   
 
+    @action(detail=True, methods=["get"], url_path="stock-terminado")
+    def stock_terminado(self, request, pk=None):
+        """
+        Devuelve el stock de producto terminado en esta bodega, agrupado por SKU + talla.
+        Soporta filtro opcional: ?sku=CAM-005
+        """
+        bodega = self.get_object()
+        sku = (request.query_params.get("sku") or "").strip()
+
+        qs = (
+            NotaEnsambleDetalle.objects
+            .filter(cantidad__gt=0)
+            .filter(
+                Q(bodega_actual=bodega) |
+                Q(bodega_actual__isnull=True, nota__bodega=bodega)
+            )
+        )
+
+        if sku:
+            qs = qs.filter(producto__codigo_sku=sku)
+
+        data = (
+            qs.values("producto__codigo_sku", "producto__nombre", "talla")
+              .annotate(cantidad=Sum("cantidad"))
+              .order_by("producto__codigo_sku", "talla")
+        )
+
+        # Normaliza keys a lo que el front consume fácil
+        result = [
+            {
+                "producto_id": row["producto__codigo_sku"],
+                "producto_nombre": row["producto__nombre"],
+                "talla": row["talla"] or "",
+                "cantidad": str(row["cantidad"] or 0),
+                "bodega_id": bodega.id,
+                "bodega_nombre": bodega.nombre,
+            }
+            for row in data
+        ]
+
+        return Response(result)
+
     @action(detail=True, methods=["get"], url_path="contenido")
     def contenido(self, request, pk=None):
         bodega = self.get_object()
@@ -765,3 +808,90 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
 
 
         return Response({"ok": True, "cantidad_movida": str(cantidad)}, status=status.HTTP_200_OK)
+
+class NotaSalidaProductoViewSet(viewsets.ModelViewSet):
+    queryset = NotaSalidaProducto.objects.all().prefetch_related("detalles", "detalles__afectaciones")
+    serializer_class = NotaSalidaProductoSerializer
+
+    @action(detail=True, methods=["get"], url_path="pdf")
+    def pdf(self, request, pk=None):
+        salida = get_object_or_404(
+            NotaSalidaProducto.objects.prefetch_related("detalles", "detalles__afectaciones"),
+            pk=pk
+        )
+
+        response = HttpResponse(content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{salida.numero}.pdf"'
+
+        c = canvas.Canvas(response, pagesize=letter)
+        width, height = letter
+
+        y = height - 50
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, y, f"NOTA DE SALIDA - {salida.numero}")
+        y -= 20
+
+        c.setFont("Helvetica", 10)
+        c.drawString(50, y, f"Fecha: {salida.fecha}")
+        y -= 14
+        c.drawString(50, y, f"Bodega: {salida.bodega.codigo} - {salida.bodega.nombre}")
+        y -= 14
+        tercero_txt = f"{salida.tercero.codigo} - {salida.tercero.nombre}" if salida.tercero else "-"
+        c.drawString(50, y, f"Tercero: {tercero_txt}")
+        y -= 14
+
+        if salida.observacion:
+            c.drawString(50, y, f"Observación: {salida.observacion[:120]}")
+            y -= 14
+
+        y -= 10
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(50, y, "Detalle")
+        y -= 14
+
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(50, y, "SKU")
+        c.drawString(120, y, "Producto")
+        c.drawString(320, y, "Talla")
+        c.drawString(370, y, "Cantidad")
+        c.drawString(450, y, "Costo U.")
+        c.drawString(520, y, "Total")
+        y -= 10
+        c.line(50, y, 560, y)
+        y -= 12
+
+        c.setFont("Helvetica", 9)
+        for d in salida.detalles.all():
+            if y < 80:
+                c.showPage()
+                y = height - 50
+                c.setFont("Helvetica-Bold", 9)
+                c.drawString(50, y, "SKU")
+                c.drawString(120, y, "Producto")
+                c.drawString(320, y, "Talla")
+                c.drawString(370, y, "Cantidad")
+                c.drawString(450, y, "Costo U.")
+                c.drawString(520, y, "Total")
+                y -= 10
+                c.line(50, y, 560, y)
+                y -= 12
+                c.setFont("Helvetica", 9)
+
+            sku = d.producto.codigo_sku
+            nombre = d.producto.nombre[:30]
+            talla = d.talla or "-"
+            cantidad = str(d.cantidad)
+            cu = str(d.costo_unitario) if d.costo_unitario is not None else "-"
+            total = str(d.total) if d.total is not None else "-"
+
+            c.drawString(50, y, sku)
+            c.drawString(120, y, nombre)
+            c.drawString(320, y, talla)
+            c.drawRightString(420, y, cantidad)
+            c.drawRightString(505, y, cu)
+            c.drawRightString(560, y, total)
+            y -= 14
+
+        c.showPage()
+        c.save()
+        return response

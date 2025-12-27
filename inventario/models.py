@@ -150,7 +150,8 @@ class Insumo(models.Model):
     codigo = models.CharField(max_length=50, primary_key=True)
 
     nombre = models.CharField(max_length=100)
-    descripcion = models.TextField(null=True, blank=True)
+    observacion = models.TextField(blank=True, default="")  # antes: descripcion
+    factura = models.CharField(max_length=120, blank=True, default="")
 
     # ✅ si no llega, se copia del código; referencia no se puede repetir
     referencia = models.CharField(max_length=50, unique=True)
@@ -334,3 +335,74 @@ class TrasladoProducto(models.Model):
 
     def __str__(self):
         return f"Traslado {self.id} {self.producto_id} {self.cantidad} {self.bodega_origen_id}->{self.bodega_destino_id}"
+
+class NotaSalidaProducto(models.Model):
+    """
+    Historial / documento de salida de producto terminado.
+    """
+    numero = models.CharField(max_length=30, unique=True, blank=True)  # se llena al guardar
+    fecha = models.DateField(default=timezone.now)
+
+    bodega = models.ForeignKey("Bodega", on_delete=models.PROTECT, related_name="salidas")
+    tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT, null=True, blank=True, related_name="salidas")
+
+    observacion = models.TextField(blank=True)
+
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-creado_en"]
+
+    def __str__(self):
+        return self.numero or f"SALIDA-{self.id}"
+
+    def save(self, *args, **kwargs):
+        creating = self.pk is None
+        super().save(*args, **kwargs)
+
+        # Genera consecutivo tipo: NS-20251226-000123
+        if creating and not self.numero:
+            self.numero = f"NS-{self.fecha.strftime('%Y%m%d')}-{self.id:06d}"
+            super().save(update_fields=["numero"])
+
+
+class NotaSalidaProductoDetalle(models.Model):
+    salida = models.ForeignKey(NotaSalidaProducto, on_delete=models.CASCADE, related_name="detalles")
+
+    producto = models.ForeignKey("Producto", on_delete=models.PROTECT)
+    talla = models.CharField(max_length=20, blank=True)
+
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0.000"))
+
+    costo_unitario = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        if self.cantidad is None or self.cantidad <= 0:
+            raise ValidationError("La cantidad de salida debe ser mayor a 0.")
+
+    @property
+    def total(self):
+        if self.costo_unitario is None:
+            return None
+        return (self.cantidad or Decimal("0")) * (self.costo_unitario or Decimal("0"))
+
+
+class NotaSalidaAfectacionStock(models.Model):
+    """
+    Traza EXACTAMENTE de qué NotaEnsambleDetalle se descontó stock (FIFO).
+    """
+    salida_detalle = models.ForeignKey(
+        NotaSalidaProductoDetalle, on_delete=models.CASCADE, related_name="afectaciones"
+    )
+    detalle_stock = models.ForeignKey(
+        "NotaEnsambleDetalle", on_delete=models.PROTECT, related_name="salidas_afectadas"
+    )
+
+    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0.000"))
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        if self.cantidad is None or self.cantidad <= 0:
+            raise ValidationError("La cantidad afectada debe ser mayor a 0.")
