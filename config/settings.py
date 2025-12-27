@@ -126,7 +126,7 @@ if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
 else:
     CORS_ALLOWED_ORIGINS = [
-        "https://TU-FRONTEND.onrender.com",
+        "https://inventario-frontend-5usw.onrender.com",
     ]
 
 # --------------------------------------------------
