@@ -14,13 +14,13 @@ from reportlab.pdfgen import canvas
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla,
-    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto, NotaSalidaProducto
+    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto, NotaSalidaProducto, InsumoMovimiento
 )
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
     TerceroSerializer, DatosAdicionalesWriteSerializer,
-    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer, NotaSalidaProductoSerializer
+    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer, NotaSalidaProductoSerializer, InsumoMovimientoSerializer, InsumoMovimientoInputSerializer
 )
 
 def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
@@ -55,6 +55,87 @@ def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
         # aplicar delta
         ins.cantidad = _d(ins.cantidad) - cantidad
         ins.save(update_fields=["cantidad"])
+
+def _decimal(v, field_name):
+    try:
+        return Decimal(str(v))
+    except Exception:
+        raise ValidationError({field_name: "Valor inválido"})
+
+def registrar_movimiento_sin_afectar_stock(*, insumo, tercero, tipo, cantidad, costo_unitario, bodega=None, factura="", observacion="", nota_ensamble=None):
+    """
+    Registra historial SIN modificar stock (útil para CREACION cuando ya guardaste la cantidad en Insumo).
+    """
+    cantidad = _decimal(cantidad, "cantidad")
+    if cantidad < 0:
+        raise ValidationError({"cantidad": "No puede ser negativa"})
+
+    costo_unitario = _decimal(costo_unitario, "costo_unitario")
+    total = (cantidad * costo_unitario).quantize(Decimal("0.01"))
+
+    mov = InsumoMovimiento.objects.create(
+        insumo=insumo,
+        tercero=tercero,
+        bodega=bodega or insumo.bodega,
+        tipo=tipo,
+        cantidad=cantidad,
+        unidad_medida=getattr(insumo, "unidad_medida", "") or "",
+        costo_unitario=costo_unitario,
+        total=total,
+        saldo_resultante=insumo.cantidad,  # ya está guardado
+        factura=factura or getattr(insumo, "factura", "") or "",
+        observacion=observacion or "",
+        nota_ensamble=nota_ensamble,
+    )
+    return mov
+
+def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario=None, bodega=None, factura="", observacion="", nota_ensamble=None):
+    """
+    Modifica stock + registra historial en una transacción.
+    Para ENTRADA/SALIDA/AJUSTE/CONSUMO_ENSAMBLE.
+    """
+    cantidad = _decimal(cantidad, "cantidad")
+    if cantidad <= 0:
+        raise ValidationError({"cantidad": "Debe ser mayor a 0"})
+
+    if costo_unitario is None or str(costo_unitario) == "":
+        costo_unitario = insumo.costo_unitario or Decimal("0.00")
+    else:
+        costo_unitario = _decimal(costo_unitario, "costo_unitario")
+
+    total = (cantidad * costo_unitario).quantize(Decimal("0.01"))
+
+    with transaction.atomic():
+        insumo.refresh_from_db()
+
+        if tipo in ("SALIDA", "CONSUMO_ENSAMBLE"):
+            if insumo.cantidad < cantidad:
+                raise ValidationError({"cantidad": "Stock insuficiente"})
+            insumo.cantidad = (insumo.cantidad - cantidad)
+        elif tipo in ("ENTRADA", "AJUSTE"):
+            insumo.cantidad = (insumo.cantidad + cantidad)
+        else:
+            raise ValidationError({"tipo": "Tipo inválido"})
+
+        insumo.save(update_fields=["cantidad"])
+
+        mov = InsumoMovimiento.objects.create(
+            insumo=insumo,
+            tercero=tercero,
+            bodega=bodega or insumo.bodega,
+            tipo=tipo,
+            cantidad=cantidad,
+            unidad_medida=getattr(insumo, "unidad_medida", "") or "",
+            costo_unitario=costo_unitario,
+            total=total,
+            saldo_resultante=insumo.cantidad,
+            factura=factura or getattr(insumo, "factura", "") or "",
+            observacion=observacion or "",
+            nota_ensamble=nota_ensamble,
+        )
+
+    return mov
+
 
 class DebugValidationMixin:
     def create(self, request, *args, **kwargs):
@@ -664,13 +745,87 @@ class DatosAdicionalesProductoViewSet(DebugValidationMixin, viewsets.ModelViewSe
     serializer_class = DatosAdicionalesWriteSerializer
 
 
-class InsumoViewSet(DebugValidationMixin, viewsets.ModelViewSet):
-    queryset = (
-        Insumo.objects
-        .select_related("bodega", "proveedor", "tercero")
-        .order_by("nombre")
-    )
+class InsumoViewSet(viewsets.ModelViewSet):
+    queryset = Insumo.objects.select_related("bodega", "proveedor", "tercero").order_by("nombre")
     serializer_class = InsumoSerializer
+
+    def perform_create(self, serializer):
+        insumo = serializer.save()
+
+        # Registra "CREACION" en historial (sin afectar stock) usando el tercero del insumo.
+        # Esto evita doble conteo porque el insumo ya quedó con cantidad guardada.
+        tercero = insumo.tercero
+        if tercero:
+            registrar_movimiento_sin_afectar_stock(
+                insumo=insumo,
+                tercero=tercero,
+                tipo="CREACION",
+                cantidad=insumo.cantidad,
+                costo_unitario=insumo.costo_unitario,
+                bodega=insumo.bodega,
+                factura=getattr(insumo, "factura", "") or "",
+                observacion="Creación de insumo",
+            )
+
+    @action(detail=True, methods=["get"], url_path="movimientos")
+    def movimientos(self, request, pk=None):
+        """
+        GET /insumos/{codigo}/movimientos/?page=... (paginación la da DRF si la tienes global)
+        """
+        insumo = self.get_object()
+        qs = InsumoMovimiento.objects.select_related("insumo", "tercero", "bodega").filter(insumo=insumo)
+
+        tipo = request.query_params.get("tipo")
+        if tipo:
+            qs = qs.filter(tipo=tipo)
+
+        tercero_id = request.query_params.get("tercero_id")
+        if tercero_id:
+            qs = qs.filter(tercero_id=tercero_id)
+
+        bodega_id = request.query_params.get("bodega_id")
+        if bodega_id:
+            qs = qs.filter(bodega_id=bodega_id)
+
+        # paginación DRF
+        page = self.paginate_queryset(qs.order_by("-fecha", "-id"))
+        if page is not None:
+            ser = InsumoMovimientoSerializer(page, many=True)
+            return self.get_paginated_response(ser.data)
+
+        return Response(InsumoMovimientoSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="movimiento")
+    def movimiento(self, request, pk=None):
+        """
+        POST /insumos/{codigo}/movimiento/
+        Body: { tipo: ENTRADA|SALIDA|AJUSTE, tercero_id, cantidad, costo_unitario?, bodega_id?, factura?, observacion? }
+        """
+        insumo = self.get_object()
+        inp = InsumoMovimientoInputSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
+
+        tipo = data["tipo"]
+        tercero = Tercero.objects.get(id=data["tercero_id"])
+        bodega = None
+        if data.get("bodega_id"):
+            bodega = Bodega.objects.get(id=data["bodega_id"])
+
+        # ENTRADA/SALIDA/AJUSTE afectan stock
+        mov = aplicar_movimiento_insumo(
+            insumo=insumo,
+            tercero=tercero,
+            tipo=tipo,
+            cantidad=data["cantidad"],
+            costo_unitario=data.get("costo_unitario", None),
+            bodega=bodega,
+            factura=data.get("factura", ""),
+            observacion=data.get("observacion", ""),
+        )
+
+        return Response(InsumoMovimientoSerializer(mov).data, status=status.HTTP_201_CREATED)
+
 
 
 class TallaViewSet(viewsets.ModelViewSet):
@@ -895,3 +1050,32 @@ class NotaSalidaProductoViewSet(viewsets.ModelViewSet):
         c.showPage()
         c.save()
         return response
+
+class InsumoMovimientoViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Kardex global:
+    GET /insumo-movimientos/?insumo=INS-001&tipo=ENTRADA&tercero_id=1&bodega_id=2
+    """
+    queryset = InsumoMovimiento.objects.select_related("insumo", "tercero", "bodega").all()
+    serializer_class = InsumoMovimientoSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+
+        insumo_codigo = self.request.query_params.get("insumo")
+        if insumo_codigo:
+            qs = qs.filter(insumo_id=insumo_codigo)
+
+        tipo = self.request.query_params.get("tipo")
+        if tipo:
+            qs = qs.filter(tipo=tipo)
+
+        tercero_id = self.request.query_params.get("tercero_id")
+        if tercero_id:
+            qs = qs.filter(tercero_id=tercero_id)
+
+        bodega_id = self.request.query_params.get("bodega_id")
+        if bodega_id:
+            qs = qs.filter(bodega_id=bodega_id)
+
+        return qs.order_by("-fecha", "-id")

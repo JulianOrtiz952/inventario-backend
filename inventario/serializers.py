@@ -3,7 +3,7 @@ from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble,
     ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto,
-    NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock,
+    NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock, InsumoMovimiento
 )
 from django.db import transaction
 from .services.pricing import calculate_product_prices
@@ -195,6 +195,8 @@ class InsumoSerializer(serializers.ModelSerializer):
             "referencia",
             "bodega",
             "bodega_id",
+            "unidad_medida",
+            "color",
             "tercero",
             "tercero_id",
             "cantidad",
@@ -285,6 +287,9 @@ class NotaEnsambleInsumoSerializer(serializers.ModelSerializer):
 class NotaEnsambleInsumoWriteSerializer(serializers.Serializer):
     insumo_codigo = serializers.CharField()
     cantidad = serializers.DecimalField(max_digits=12, decimal_places=3)
+    costo_unitario = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False, allow_null=True
+    )
 
 
 # -----------------------------
@@ -299,7 +304,12 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
     tercero = TerceroSerializer(read_only=True)
 
     # --- ESCRITURA (ids) ---
-    bodega_id = serializers.PrimaryKeyRelatedField(queryset=Bodega.objects.all(), source="bodega", write_only=True)
+    bodega_id = serializers.PrimaryKeyRelatedField(
+        queryset=Bodega.objects.all(),
+        source="bodega",
+        write_only=True
+    )
+
     tercero_id = serializers.PrimaryKeyRelatedField(
         queryset=Tercero.objects.all(),
         source="tercero",
@@ -331,6 +341,15 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
             "insumos_input",
         ]
 
+    def validate(self, attrs):
+        insumos_data = attrs.get("insumos_input") or []
+        tercero = attrs.get("tercero")  # viene por source="tercero"
+        if insumos_data and not tercero:
+            raise serializers.ValidationError({
+                "tercero_id": "El tercero es obligatorio cuando se consumen insumos en una nota de ensamble."
+            })
+        return attrs
+
     @transaction.atomic
     def create(self, validated_data):
         detalles_data = validated_data.pop("detalles_input", [])
@@ -338,31 +357,82 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
 
         nota = NotaEnsamble.objects.create(**validated_data)
 
-        # detalles
+        # 1) Detalles (productos terminados)
         NotaEnsambleDetalle.objects.bulk_create(
             [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
         )
 
-        # insumos manuales
+        # 2) Insumos consumidos (guardas el vínculo Nota->Insumo) + Kardex (CONSUMO_ENSAMBLE)
         if insumos_data:
+            # Traer y bloquear insumos
+            codigos = [x["insumo_codigo"] for x in insumos_data]
+            insumos_qs = (
+                Insumo.objects
+                .select_for_update()
+                .filter(codigo__in=codigos)
+            )
+            insumos_map = {i.codigo: i for i in insumos_qs}
+
             insumo_objs = []
-            insumos_map = {i.codigo: i for i in Insumo.objects.filter(codigo__in=[x["insumo_codigo"] for x in insumos_data])}
 
-            for i in insumos_data:
-                ins = insumos_map.get(i["insumo_codigo"])
+            for item in insumos_data:
+                codigo = item["insumo_codigo"]
+                cantidad = item["cantidad"]
+
+                ins = insumos_map.get(codigo)
                 if not ins:
-                    raise serializers.ValidationError({"insumos_input": f"Insumo {i['insumo_codigo']} no existe."})
+                    raise serializers.ValidationError({"insumos_input": f"Insumo {codigo} no existe."})
 
+                if cantidad is None or cantidad <= 0:
+                    raise serializers.ValidationError({"cantidad": f"La cantidad debe ser > 0 para {codigo}."})
+
+                # ✅ Validar stock
+                if ins.cantidad < cantidad:
+                    raise serializers.ValidationError({"cantidad": f"Stock insuficiente para {codigo}."})
+
+                # ✅ Restar stock (esto mantiene lo que ya haces hoy, pero ahora controlado aquí)
+                ins.cantidad = (ins.cantidad - cantidad)
+
+                # costo_unitario para el movimiento: si viene en payload úsalo; si no, usa el del insumo
+                cu_payload = item.get("costo_unitario", None)
+                costo_unitario = (cu_payload if cu_payload is not None else ins.costo_unitario)
+
+                # (opcional) si quieres actualizar el costo_unitario del insumo al último usado:
+                # ins.costo_unitario = costo_unitario
+
+                ins.save(update_fields=["cantidad"])  # agrega "costo_unitario" si lo actualizas también
+
+                # ✅ guardar línea de insumo usada en la nota (relación)
                 insumo_objs.append(
                     NotaEnsambleInsumo(
                         nota=nota,
                         insumo=ins,
-                        cantidad=i["cantidad"]
+                        cantidad=cantidad
                     )
                 )
+
+                # ✅ Registrar movimiento en Kardex
+                total = (Decimal(cantidad) * Decimal(costo_unitario)).quantize(Decimal("0.01"))
+
+                InsumoMovimiento.objects.create(
+                    insumo=ins,
+                    tercero=nota.tercero,     # obligatorio en tu modelo
+                    bodega=nota.bodega,
+                    tipo=InsumoMovimiento.Tipo.CONSUMO_ENSAMBLE,
+                    cantidad=cantidad,
+                    unidad_medida=ins.unidad_medida or "",
+                    costo_unitario=costo_unitario,
+                    total=total,
+                    saldo_resultante=ins.cantidad,
+                    factura="",  # normalmente no aplica en consumo por ensamble
+                    observacion=f"Consumo por nota de ensamble #{nota.id}",
+                    nota_ensamble=nota
+                )
+
             NotaEnsambleInsumo.objects.bulk_create(insumo_objs)
 
         return nota
+
 
 class TrasladoProductoSerializer(serializers.ModelSerializer):
     tercero = TerceroSerializer(read_only=True)
@@ -525,3 +595,46 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
                 restante -= tomar
 
         return salida
+class InsumoMovimientoSerializer(serializers.ModelSerializer):
+    insumo_codigo = serializers.CharField(source="insumo.codigo", read_only=True)
+    insumo_nombre = serializers.CharField(source="insumo.nombre", read_only=True)
+
+    tercero_nombre = serializers.CharField(source="tercero.nombre", read_only=True)
+    bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
+
+    class Meta:
+        model = InsumoMovimiento
+        fields = [
+            "id",
+            "fecha",
+            "tipo",
+            "cantidad",
+            "unidad_medida",
+            "costo_unitario",
+            "total",
+            "saldo_resultante",
+            "factura",
+            "observacion",
+            "nota_ensamble",
+            "insumo",
+            "insumo_codigo",
+            "insumo_nombre",
+            "tercero",
+            "tercero_nombre",
+            "bodega",
+            "bodega_nombre",
+        ]
+        read_only_fields = ["id", "fecha", "total", "saldo_resultante"]
+
+
+class InsumoMovimientoInputSerializer(serializers.Serializer):
+    tipo = serializers.ChoiceField(choices=[
+        "ENTRADA", "SALIDA", "AJUSTE"
+    ])
+    tercero_id = serializers.IntegerField()
+    cantidad = serializers.DecimalField(max_digits=14, decimal_places=3)
+    costo_unitario = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
+    bodega_id = serializers.IntegerField(required=False, allow_null=True)
+
+    factura = serializers.CharField(required=False, allow_blank=True)
+    observacion = serializers.CharField(required=False, allow_blank=True)

@@ -158,6 +158,9 @@ class Insumo(models.Model):
 
     stock_minimo = models.DecimalField(max_digits=12, decimal_places=3, default=0)
 
+    unidad_medida = models.CharField(max_length=10, blank=True, default="")
+    color = models.CharField(max_length=50, blank=True, default="")
+
     bodega = models.ForeignKey(
         Bodega,
         on_delete=models.PROTECT,
@@ -406,3 +409,38 @@ class NotaSalidaAfectacionStock(models.Model):
     def clean(self):
         if self.cantidad is None or self.cantidad <= 0:
             raise ValidationError("La cantidad afectada debe ser mayor a 0.")
+
+class InsumoMovimiento(models.Model):
+    class Tipo(models.TextChoices):
+        CREACION = "CREACION", "Creación"
+        ENTRADA = "ENTRADA", "Entrada"
+        SALIDA = "SALIDA", "Salida"
+        CONSUMO_ENSAMBLE = "CONSUMO_ENSAMBLE", "Consumo por ensamble"
+        AJUSTE = "AJUSTE", "Ajuste"
+
+    insumo = models.ForeignKey("Insumo", on_delete=models.PROTECT, related_name="movimientos")
+    tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT)
+    bodega = models.ForeignKey("Bodega", on_delete=models.PROTECT, null=True, blank=True)
+
+    tipo = models.CharField(max_length=30, choices=Tipo.choices)
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    cantidad = models.DecimalField(max_digits=14, decimal_places=3)  # SIEMPRE positiva
+    unidad_medida = models.CharField(max_length=10, blank=True, default="")
+    costo_unitario = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+
+    saldo_resultante = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+
+    factura = models.CharField(max_length=120, blank=True, default="")
+    observacion = models.TextField(blank=True, default="")
+
+    # Referencia opcional a una nota de ensamble (para trazabilidad)
+    nota_ensamble = models.ForeignKey("NotaEnsamble", on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        ordering = ["-fecha", "-id"]
+        indexes = [
+            models.Index(fields=["insumo", "-fecha"]),
+            models.Index(fields=["tipo", "-fecha"]),
+        ]
