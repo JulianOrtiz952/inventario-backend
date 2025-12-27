@@ -3,7 +3,7 @@ from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble,
     ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto,
-    NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock, InsumoMovimiento
+    NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock, InsumoMovimiento, ProductoTerminadoMovimiento
 )
 from django.db import transaction
 from .services.pricing import calculate_product_prices
@@ -638,3 +638,40 @@ class InsumoMovimientoInputSerializer(serializers.Serializer):
 
     factura = serializers.CharField(required=False, allow_blank=True)
     observacion = serializers.CharField(required=False, allow_blank=True)
+
+
+class ProductoTerminadoMovimientoSerializer(serializers.ModelSerializer):
+    producto_codigo = serializers.CharField(source="producto.codigo_sku", read_only=True)
+    producto_nombre = serializers.CharField(source="producto.nombre", read_only=True)
+    talla_nombre = serializers.CharField(source="talla.nombre", read_only=True, allow_null=True)
+
+    tercero_nombre = serializers.CharField(source="tercero.nombre", read_only=True)
+    bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
+
+    class Meta:
+        model = ProductoTerminadoMovimiento
+        fields = [
+            "id",
+            "fecha",
+            "tipo",
+            "cantidad",
+            "costo_unitario",
+            "total",
+            "saldo_global_resultante",
+            "observacion",
+            "nota_ensamble",
+
+            "producto",
+            "producto_codigo",
+            "producto_nombre",
+
+            "talla",
+            "talla_nombre",
+
+            "tercero",
+            "tercero_nombre",
+
+            "bodega",
+            "bodega_nombre",
+        ]
+        read_only_fields = ["id", "total", "saldo_global_resultante"]

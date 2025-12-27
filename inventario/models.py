@@ -444,3 +444,50 @@ class InsumoMovimiento(models.Model):
             models.Index(fields=["insumo", "-fecha"]),
             models.Index(fields=["tipo", "-fecha"]),
         ]
+
+class ProductoTerminadoMovimiento(models.Model):
+    class Tipo(models.TextChoices):
+        INGRESO_EXCEL = "INGRESO_EXCEL", "Ingreso por Excel"
+        AJUSTE = "AJUSTE", "Ajuste"
+        SALIDA = "SALIDA", "Salida"  # (si luego quieres unificar con NotaSalidaProducto)
+
+    fecha = models.DateTimeField(default=timezone.now)
+
+    bodega = models.ForeignKey("Bodega", on_delete=models.PROTECT, related_name="movs_producto_terminado")
+    tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT, related_name="movs_producto_terminado")
+
+    tipo = models.CharField(max_length=30, choices=Tipo.choices, default=Tipo.INGRESO_EXCEL)
+
+    producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="movs_terminado")
+    talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="movs_terminado")
+
+    cantidad = models.DecimalField(max_digits=14, decimal_places=3)  # SIEMPRE positiva
+    costo_unitario = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+
+    # stock global (DatosAdicionalesProducto.stock) luego del movimiento
+    saldo_global_resultante = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+
+    # documento asociado (reusamos NotaEnsamble como “documento de ingreso”)
+    nota_ensamble = models.ForeignKey("NotaEnsamble", on_delete=models.SET_NULL, null=True, blank=True)
+
+    observacion = models.TextField(blank=True, default="")
+
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-fecha", "-id"]
+        indexes = [
+            models.Index(fields=["producto", "-fecha"]),
+            models.Index(fields=["bodega", "-fecha"]),
+            models.Index(fields=["tipo", "-fecha"]),
+        ]
+
+    def clean(self):
+        if self.cantidad is None or self.cantidad <= 0:
+            raise ValidationError({"cantidad": "Debe ser mayor a 0."})
+
+    def save(self, *args, **kwargs):
+        if self.total is None or self.total == Decimal("0.00"):
+            self.total = (Decimal(str(self.cantidad or 0)) * Decimal(str(self.costo_unitario or 0))).quantize(Decimal("0.01"))
+        super().save(*args, **kwargs)

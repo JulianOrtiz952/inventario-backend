@@ -5,7 +5,9 @@ from rest_framework.routers import DefaultRouter
 from inventario.views import (
     InsumoViewSet, ProveedorViewSet, ProductoViewSet, BodegaViewSet,
     ImpuestoViewSet, PrecioProductoViewSet, TerceroViewSet,
-    DatosAdicionalesProductoViewSet, TallaViewSet, NotaEnsambleViewSet, ProductoInsumoViewSet, TrasladoProductoViewSet, NotaSalidaProductoViewSet, InsumoMovimientoViewSet
+    DatosAdicionalesProductoViewSet, TallaViewSet, NotaEnsambleViewSet,
+    ProductoInsumoViewSet, TrasladoProductoViewSet, NotaSalidaProductoViewSet, InsumoMovimientoViewSet,
+    ExcelImportViewSet
 )
 
 router = DefaultRouter()
@@ -32,6 +34,8 @@ router.register(r"traslados-producto", TrasladoProductoViewSet, basename="trasla
 router.register(r"salidas-producto", NotaSalidaProductoViewSet, basename="salidas-producto")
 
 router.register(r"insumo-movimientos", InsumoMovimientoViewSet, basename="insumo-movimientos")
+
+router.register(r"excel", ExcelImportViewSet, basename="excel")
 
 urlpatterns = [
     path("admin/", admin.site.urls),

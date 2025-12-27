@@ -10,17 +10,27 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from openpyxl import Workbook, load_workbook
+from .renderers import XLSXRenderer
+import io
+from datetime import datetime
+from django.utils import timezone
+
 
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla,
-    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto, NotaSalidaProducto, InsumoMovimiento
+    NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo,
+    TrasladoProducto, NotaSalidaProducto, InsumoMovimiento,
+    ProductoTerminadoMovimiento
 )
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
     TerceroSerializer, DatosAdicionalesWriteSerializer,
-    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer, TrasladoProductoSerializer, NotaSalidaProductoSerializer, InsumoMovimientoSerializer, InsumoMovimientoInputSerializer
+    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer,
+    TrasladoProductoSerializer, NotaSalidaProductoSerializer, InsumoMovimientoSerializer, InsumoMovimientoInputSerializer,
+    ProductoTerminadoMovimientoSerializer
 )
 
 def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
@@ -136,6 +146,30 @@ def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario
 
     return mov
 
+def _parse_decimal(v, field):
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        return Decimal(str(v).replace(",", ".")).quantize(Decimal("0.001"))
+    except Exception:
+        raise ValidationError({field: f"Valor inválido: {v}"})
+
+
+def _parse_date(v, field):
+    if v is None or str(v).strip() == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day"):
+        return v
+    # strings
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    raise ValidationError({field: f"Fecha inválida: {v}. Formatos: YYYY-MM-DD o DD/MM/YYYY"})
 
 class DebugValidationMixin:
     def create(self, request, *args, **kwargs):
@@ -1079,3 +1113,374 @@ class InsumoMovimientoViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(bodega_id=bodega_id)
 
         return qs.order_by("-fecha", "-id")
+
+class ExcelImportViewSet(viewsets.ViewSet):
+    """
+    Endpoints:
+      GET  /api/excel/plantilla-insumos/
+      POST /api/excel/importar-insumos/         (multipart: file)
+      GET  /api/excel/plantilla-terminado/
+      POST /api/excel/importar-terminado/       (multipart: file)
+
+      GET  /api/excel/kardex-terminado/?sku=...&bodega_id=...&tercero_id=...
+    """
+
+    @action(detail=False, methods=["get"], url_path="plantilla-insumos", renderer_classes=[XLSXRenderer])
+    def plantilla_insumos(self, request):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Insumos"
+
+        headers = [
+            "codigo", "nombre", "bodega_id",
+            "cantidad_entrada", "costo_unitario",
+            "tercero_id",
+            "referencia", "factura", "unidad_medida", "color", "stock_minimo", "observacion",
+        ]
+        ws.append(headers)
+        ws.append([
+            "INS-001", "Tela", 1,
+            "10.000", "2500.00",
+            1,
+            "REF-TELA-01", "FAC-98451", "M", "Blanco", "2.000", "Lote para camisas"
+        ])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        content = buf.getvalue()
+
+        resp = Response(content, content_type=XLSXRenderer.media_type)
+        resp["Content-Disposition"] = 'attachment; filename="plantilla_insumos.xlsx"'
+        return resp
+
+    @action(detail=False, methods=["post"], url_path="importar-insumos")
+    @transaction.atomic
+    def importar_insumos(self, request):
+        file = request.FILES.get("file")
+        if not file:
+            raise ValidationError({"file": "Debe enviar un archivo .xlsx en multipart/form-data con key 'file'."})
+
+        file = request.FILES.get("file")
+        if not file:
+            raise ValidationError({"file": "Debe enviar un .xlsx con key 'file'."})
+
+        # ✅ 1) tamaño
+        if getattr(file, "size", 0) == 0:
+            raise ValidationError({"file": "El archivo llegó vacío (0 bytes). Revisa el FormData en el frontend."})
+
+        # ✅ 2) validar firma ZIP: XLSX empieza por bytes 'PK'
+        head = file.read(4)
+        file.seek(0)
+        if head[:2] != b"PK":
+            raise ValidationError({
+                "file": (
+                    "El archivo no parece ser un .xlsx real (debe ser Excel ZIP). "
+                    "No lo renombres: descárgalo como 'Microsoft Excel (.xlsx)'."
+                )
+            })
+
+        # ✅ 3) intentar leer
+        try:
+            wb = load_workbook(filename=file, data_only=True)
+        except Exception as e:
+            raise ValidationError({"file": f"No se pudo leer el Excel: {str(e)}"})
+
+        if "Insumos" in wb.sheetnames:
+            ws = wb["Insumos"]
+        else:
+            ws = wb.active
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise ValidationError({"file": "El Excel está vacío."})
+
+        header = [str(x).strip() if x is not None else "" for x in rows[0]]
+        required = ["codigo", "nombre", "bodega_id", "cantidad_entrada", "costo_unitario", "tercero_id"]
+        missing = [h for h in required if h not in header]
+        if missing:
+            raise ValidationError({"headers": f"Faltan columnas requeridas: {missing}"})
+
+        idx = {h: header.index(h) for h in header if h}
+
+        ok = 0
+        errores = []
+        movimientos_creados = []
+
+        for i, r in enumerate(rows[1:], start=2):
+            try:
+                codigo = str(r[idx["codigo"]]).strip()
+                nombre = str(r[idx["nombre"]]).strip()
+
+                bodega_id = r[idx["bodega_id"]]
+                tercero_id = r[idx["tercero_id"]]
+
+                cantidad_entrada = _parse_decimal(r[idx["cantidad_entrada"]], "cantidad_entrada")
+                costo_unitario = _parse_decimal(r[idx["costo_unitario"]], "costo_unitario")
+
+                if not codigo:
+                    raise ValidationError({"codigo": "Vacío"})
+                if cantidad_entrada is None or cantidad_entrada <= 0:
+                    raise ValidationError({"cantidad_entrada": "Debe ser > 0"})
+
+                bodega = Bodega.objects.get(id=int(bodega_id))
+                tercero = Tercero.objects.get(id=int(tercero_id))
+
+                referencia = (r[idx["referencia"]] if "referencia" in idx else None)
+                factura = (r[idx["factura"]] if "factura" in idx else "")
+                unidad_medida = (r[idx["unidad_medida"]] if "unidad_medida" in idx else "")
+                color = (r[idx["color"]] if "color" in idx else "")
+                stock_minimo = _parse_decimal(r[idx["stock_minimo"]], "stock_minimo") if "stock_minimo" in idx else None
+                observacion = (r[idx["observacion"]] if "observacion" in idx else "")
+
+                insumo = Insumo.objects.filter(codigo=codigo).first()
+                if not insumo:
+                    insumo = Insumo.objects.create(
+                        codigo=codigo,
+                        nombre=nombre,
+                        bodega=bodega,
+                        referencia=str(referencia).strip() if referencia else codigo,
+                        factura=str(factura or "").strip(),
+                        unidad_medida=str(unidad_medida or "").strip(),
+                        color=str(color or "").strip(),
+                        stock_minimo=stock_minimo if stock_minimo is not None else Decimal("0"),
+                        observacion=str(observacion or "").strip(),
+                        costo_unitario=(costo_unitario.quantize(Decimal("0.01")) if costo_unitario else Decimal("0.00")),
+                        cantidad=Decimal("0.000"),
+                        tercero=tercero,
+                    )
+                    # Registrar CREACION (sin afectar stock) si quieres dejarlo marcado
+                    registrar_movimiento_sin_afectar_stock(
+                        insumo=insumo,
+                        tercero=tercero,
+                        tipo="CREACION",
+                        cantidad=Decimal("0.000"),
+                        costo_unitario=insumo.costo_unitario,
+                        bodega=bodega,
+                        factura=insumo.factura,
+                        observacion="Creación por importación Excel",
+                    )
+                else:
+                    # actualiza metadata sin tocar cantidad aún (la cantidad la suma el movimiento)
+                    insumo.nombre = nombre or insumo.nombre
+                    insumo.bodega = bodega
+                    insumo.tercero = tercero
+                    if referencia:
+                        insumo.referencia = str(referencia).strip()
+                    if factura is not None:
+                        insumo.factura = str(factura or "").strip()
+                    if unidad_medida is not None:
+                        insumo.unidad_medida = str(unidad_medida or "").strip()
+                    if color is not None:
+                        insumo.color = str(color or "").strip()
+                    if stock_minimo is not None:
+                        insumo.stock_minimo = stock_minimo
+                    if observacion is not None:
+                        insumo.observacion = str(observacion or "").strip()
+                    # si viene costo_unitario en el excel, puedes actualizar el “último” costo del insumo
+                    if costo_unitario is not None:
+                        insumo.costo_unitario = costo_unitario.quantize(Decimal("0.01"))
+                    insumo.save()
+
+                mov = aplicar_movimiento_insumo(
+                    insumo=insumo,
+                    tercero=tercero,
+                    tipo="ENTRADA",
+                    cantidad=cantidad_entrada,
+                    costo_unitario=costo_unitario.quantize(Decimal("0.01")) if costo_unitario else None,
+                    bodega=bodega,
+                    factura=str(factura or "").strip(),
+                    observacion=f"Entrada por importación Excel (fila {i})",
+                )
+                movimientos_creados.append(mov.id)
+                ok += 1
+
+            except Exception as e:
+                errores.append({"fila": i, "error": str(e)})
+
+        return Response(
+            {
+                "ok": True,
+                "procesadas_ok": ok,
+                "errores": errores,
+                "movimientos_ids": movimientos_creados,
+            },
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=["get"], url_path="plantilla-terminado", renderer_classes=[XLSXRenderer])
+    def plantilla_terminado(self, request):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ProductoTerminado"
+
+        headers = [
+            "fecha", "bodega_id", "tercero_id", "observacion",
+            "producto_sku", "talla", "cantidad", "costo_unitario",
+        ]
+        ws.append(headers)
+        ws.append([
+            "2025-12-27", 1, 1, "Ingreso inicial por Excel",
+            "CAM-001", "M", "12.000", "45000.00",
+        ])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        content = buf.getvalue()
+
+        resp = Response(content, content_type=XLSXRenderer.media_type)
+        resp["Content-Disposition"] = 'attachment; filename="plantilla_producto_terminado.xlsx"'
+        return resp
+
+    @action(detail=False, methods=["post"], url_path="importar-terminado")
+    def importar_terminado(self, request):
+        file = request.FILES.get("file")
+        if not file:
+            raise ValidationError({"file": "Debe enviar un archivo .xlsx en multipart/form-data con key 'file'."})
+
+        try:
+            wb = load_workbook(filename=file, data_only=True)
+        except Exception as e:
+            raise ValidationError({"file": f"No se pudo leer el Excel: {str(e)}"})
+
+        ws = wb["ProductoTerminado"] if "ProductoTerminado" in wb.sheetnames else wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise ValidationError({"file": "El Excel está vacío."})
+
+        header = [str(x).strip() if x is not None else "" for x in rows[0]]
+        required = ["fecha", "bodega_id", "tercero_id", "producto_sku", "cantidad"]
+        missing = [h for h in required if h not in header]
+        if missing:
+            raise ValidationError({"headers": f"Faltan columnas requeridas: {missing}"})
+
+        idx = {h: header.index(h) for h in header if h}
+
+        ok = 0
+        errores = []
+        movimientos = []
+
+        # cache de notas: key -> nota_id (guardamos ID para evitar objetos “fantasma” si una fila falla)
+        notas_cache = {}  # key=(fecha,bodega_id,tercero_id,obs) -> nota_id
+
+        for i, r in enumerate(rows[1:], start=2):
+            try:
+                # ✅ transacción por fila (si falla, no rompe el resto)
+                with transaction.atomic():
+
+                    fecha = _parse_date(r[idx["fecha"]], "fecha") or timezone.now().date()
+
+                    bodega = Bodega.objects.get(id=int(r[idx["bodega_id"]]))
+                    tercero = Tercero.objects.get(id=int(r[idx["tercero_id"]]))
+
+                    obs = str(r[idx["observacion"]] or "").strip() if "observacion" in idx else ""
+                    producto_sku = str(r[idx["producto_sku"]]).strip()
+
+                    talla_txt = str(r[idx["talla"]] or "").strip() if "talla" in idx else ""
+                    cantidad = _parse_decimal(r[idx["cantidad"]], "cantidad")
+                    if cantidad is None or cantidad <= 0:
+                        raise ValidationError({"cantidad": "Debe ser > 0"})
+
+                    costo_unitario = _parse_decimal(r[idx["costo_unitario"]], "costo_unitario") if "costo_unitario" in idx else None
+                    costo_unitario = (costo_unitario.quantize(Decimal("0.01")) if costo_unitario else Decimal("0.00"))
+
+                    producto = Producto.objects.get(codigo_sku=producto_sku)
+
+                    talla_obj = None
+                    if talla_txt:
+                        talla_obj = Talla.objects.filter(nombre=talla_txt).first()
+                        if not talla_obj:
+                            raise ValidationError({"talla": f"La talla '{talla_txt}' no existe. Créala antes o deja vacío."})
+
+                    key = (str(fecha), bodega.id, tercero.id, obs)
+
+                    nota_id = notas_cache.get(key)
+                    if nota_id:
+                        nota = NotaEnsamble.objects.get(id=nota_id)
+                    else:
+                        nota = NotaEnsamble.objects.create(
+                            bodega=bodega,
+                            tercero=tercero,
+                            fecha_elaboracion=fecha,
+                            observaciones=(obs or "Ingreso por importación Excel (producto terminado)")
+                        )
+                        notas_cache[key] = nota.id
+
+                    # ✅ en vez de CREATE siempre, hacemos UPSERT: si existe, sumamos
+                    det, created = NotaEnsambleDetalle.objects.get_or_create(
+                        nota=nota,
+                        producto=producto,
+                        talla=talla_obj,
+                        bodega_actual=bodega,
+                        defaults={"cantidad": cantidad},
+                    )
+                    if not created:
+                        det.cantidad = (Decimal(str(det.cantidad or 0)) + Decimal(str(cantidad))).quantize(Decimal("0.001"))
+                        det.save(update_fields=["cantidad"])
+
+                    # stock global
+                    datos = DatosAdicionalesProducto.objects.filter(producto=producto).first()
+                    if not datos:
+                        datos = DatosAdicionalesProducto.objects.create(
+                            producto=producto,
+                            referencia="N/A",
+                            unidad=producto.unidad_medida or "",
+                            stock=Decimal("0.000"),
+                            stock_minimo=Decimal("0"),
+                            descripcion="",
+                            marca="",
+                            modelo="",
+                            codigo_arancelario="",
+                        )
+                    datos.stock = (Decimal(str(datos.stock or 0)) + Decimal(str(cantidad))).quantize(Decimal("0.001"))
+                    datos.save(update_fields=["stock"])
+
+                    mov = ProductoTerminadoMovimiento.objects.create(
+                        fecha=timezone.now(),
+                        bodega=bodega,
+                        tercero=tercero,
+                        tipo=ProductoTerminadoMovimiento.Tipo.INGRESO_EXCEL,
+                        producto=producto,
+                        talla=talla_obj,
+                        cantidad=cantidad,
+                        costo_unitario=costo_unitario,
+                        saldo_global_resultante=datos.stock,
+                        nota_ensamble=nota,
+                        observacion=f"{obs} (fila {i})".strip(),
+                    )
+
+                    movimientos.append(mov.id)
+                    ok += 1
+
+            except Exception as e:
+                errores.append({"fila": i, "error": str(e)})
+
+        return Response(
+            {
+                "ok": True,
+                "procesadas_ok": ok,
+                "errores": errores,
+                "movimientos_ids": movimientos,
+                "notas_creadas": sorted(set(notas_cache.values())),
+            },
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=["get"], url_path="kardex-terminado")
+    def kardex_terminado(self, request):
+        qs = ProductoTerminadoMovimiento.objects.select_related("producto", "talla", "tercero", "bodega", "nota_ensamble").all()
+
+        sku = (request.query_params.get("sku") or "").strip()
+        if sku:
+            qs = qs.filter(producto__codigo_sku=sku)
+
+        bodega_id = request.query_params.get("bodega_id")
+        if bodega_id and str(bodega_id).isdigit():
+            qs = qs.filter(bodega_id=int(bodega_id))
+
+        tercero_id = request.query_params.get("tercero_id")
+        if tercero_id and str(tercero_id).isdigit():
+            qs = qs.filter(tercero_id=int(tercero_id))
+
+        qs = qs.order_by("-fecha", "-id")[:200]  # límite seguro
+
+        return Response(ProductoTerminadoMovimientoSerializer(qs, many=True).data)
