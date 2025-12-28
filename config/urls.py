@@ -40,4 +40,5 @@ router.register(r"excel", ExcelImportViewSet, basename="excel")
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include(router.urls)),
+    path("api/reportes/", include("inventario.reportes_urls")), 
 ]
