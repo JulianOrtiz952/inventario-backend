@@ -4,7 +4,7 @@ from rest_framework.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
 from rest_framework.decorators import action
-from django.db.models import Sum, Count, Q, F
+from django.db.models import Sum, Count, Q, F, Case, When, DecimalField
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -121,7 +121,34 @@ def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario
 
         if tipo in ("SALIDA", "CONSUMO_ENSAMBLE"):
             if insumo.cantidad < cantidad:
-                raise ValidationError({"cantidad": "Stock insuficiente"})
+                raise ValidationError({"cantidad": "Stock global insuficiente"})
+            
+            # Validar stock de BODEGA específica (si se especifica bodega)
+            if bodega:
+                qs = InsumoMovimiento.objects.filter(insumo=insumo, bodega=bodega)
+                agg = qs.aggregate(
+                    total_entradas=Sum(
+                        Case(
+                            When(tipo__in=["CREACION", "ENTRADA", "AJUSTE"], then=F("cantidad")),
+                            default=0,
+                            output_field=DecimalField()
+                        )
+                    ),
+                    total_salidas=Sum(
+                        Case(
+                            When(tipo__in=["SALIDA", "CONSUMO_ENSAMBLE"], then=F("cantidad")),
+                            default=0,
+                            output_field=DecimalField()
+                        )
+                    )
+                )
+                entradas = agg["total_entradas"] or Decimal("0")
+                salidas = agg["total_salidas"] or Decimal("0")
+                stock_bodega = entradas - salidas
+                
+                if stock_bodega < cantidad:
+                    raise ValidationError({"cantidad": f"Stock insuficiente en bodega {bodega.nombre}. Disponible: {stock_bodega}"})
+
             insumo.cantidad = (insumo.cantidad - cantidad)
         elif tipo in ("ENTRADA", "AJUSTE"):
             insumo.cantidad = (insumo.cantidad + cantidad)
@@ -789,11 +816,17 @@ class DatosAdicionalesProductoViewSet(DebugValidationMixin, viewsets.ModelViewSe
 
 
 class InsumoViewSet(viewsets.ModelViewSet):
-    queryset = Insumo.objects.select_related("bodega", "proveedor", "tercero").order_by("nombre")
+    # Ordenar primero por activos vs inactivos (-es_activo: True=1, False=0), luego nombre
+    queryset = Insumo.objects.select_related("bodega", "proveedor", "tercero").order_by("-es_activo", "nombre")
     serializer_class = InsumoSerializer
     filterset_class = InsumoFilter
     search_fields = ["nombre", "codigo", "referencia", "observacion"]
-    ordering_fields = ["nombre", "cantidad", "costo_unitario", "creado_en"]
+    ordering_fields = ["nombre", "cantidad", "costo_unitario", "creado_en", "es_activo"]
+
+    def perform_destroy(self, instance):
+        # Soft delete: Marcar como inactivo en lugar de borrar
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
     def perform_create(self, serializer):
         insumo = serializer.save()
@@ -841,6 +874,56 @@ class InsumoViewSet(viewsets.ModelViewSet):
 
         return Response(InsumoMovimientoSerializer(qs, many=True).data)
 
+    @action(detail=True, methods=["get"], url_path="stock_por_bodega")
+    def stock_por_bodega(self, request, pk=None):
+        """
+        Retorna el stock calculado por bodega basado en el historial de movimientos.
+        """
+        insumo = self.get_object()
+        
+        # Agrupar por bodega y sumarizar
+        # ENTRADA, AJUSTE, CREACION suman (o ajustan)
+        # SALIDA, CONSUMO_ENSAMBLE restan
+        
+        from django.db.models import Sum, Case, When, F, DecimalField, Value
+        
+        # Primero, obtenemos todas las bodegas que han tenido movimiento con este insumo
+        movs = InsumoMovimiento.objects.filter(insumo=insumo).values("bodega", "bodega__nombre")
+        
+        results = movs.annotate(
+            total_entradas=Sum(
+                Case(
+                    When(tipo__in=["CREACION", "ENTRADA", "AJUSTE"], then=F("cantidad")),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            ),
+            total_salidas=Sum(
+                Case(
+                    When(tipo__in=["SALIDA", "CONSUMO_ENSAMBLE"], then=F("cantidad")),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            )
+        ).order_by("bodega__nombre")
+        
+        # Procesar resultados
+        data = []
+        for r in results:
+            bodega_nombre = r["bodega__nombre"]
+            if not bodega_nombre:
+                bodega_nombre = "Sin Bodega"
+                
+            stock = (r["total_entradas"] or 0) - (r["total_salidas"] or 0)
+            
+            # Solo mostrar si hay algo relevante (o si es 0 pero hubo movs)
+            data.append({
+                "bodega_id": r["bodega"],
+                "bodega_nombre": bodega_nombre,
+                "stock": stock
+            })
+            
+        return Response(data)
     @action(detail=True, methods=["post"], url_path="movimiento")
     def movimiento(self, request, pk=None):
         """
@@ -848,6 +931,7 @@ class InsumoViewSet(viewsets.ModelViewSet):
         Body: { tipo: ENTRADA|SALIDA|AJUSTE, tercero_id, cantidad, costo_unitario?, bodega_id?, factura?, observacion? }
         """
         insumo = self.get_object()
+        
         inp = InsumoMovimientoInputSerializer(data=request.data)
         inp.is_valid(raise_exception=True)
         data = inp.validated_data

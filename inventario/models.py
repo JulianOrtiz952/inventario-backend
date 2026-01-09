@@ -186,6 +186,8 @@ class Insumo(models.Model):
         null=True,
         blank=True
     )
+    
+    es_activo = models.BooleanField(default=True)
 
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)

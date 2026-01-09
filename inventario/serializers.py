@@ -206,13 +206,33 @@ class InsumoSerializer(serializers.ModelSerializer):
             "proveedor_id",
             "creado_en",
             "actualizado_en",
+            "es_activo",
         ]
 
     def validate(self, attrs):
+        # 1. Validar regex del código solo si se está creando o si viene en el payload
+        codigo = attrs.get("codigo")
+        if codigo:
+            import re
+            if not re.match(r'^[a-zA-Z0-9-]+$', codigo):
+                raise serializers.ValidationError({
+                    "codigo": "No se permiten caracteres especiales diferentes a '-'."
+                })
+
+        # 2. Si es update, verificar que no estén intentando cambiar el código (PK)
+        if self.instance:
+            # Si "codigo" viene en attrs y es diferente al actual
+            if codigo and codigo != self.instance.codigo:
+                raise serializers.ValidationError({
+                    "codigo": "No se puede modificar el código de un insumo existente. Si necesitas un nuevo código, crea un nuevo insumo."
+                })
+
         referencia = attrs.get("referencia")
-        codigo = attrs.get("codigo") or getattr(self.instance, "codigo", None)
-        if not referencia:
-            attrs["referencia"] = codigo
+        final_codigo = codigo or getattr(self.instance, "codigo", None)
+        
+        if not referencia and final_codigo:
+            attrs["referencia"] = final_codigo
+            
         return attrs
 
 
