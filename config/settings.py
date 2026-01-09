@@ -49,6 +49,7 @@ INSTALLED_APPS = [
 
     # apps
     "inventario",
+    "django_filters",
 ]
 
 # --------------------------------------------------
@@ -137,6 +138,11 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.AllowAny",
     ],
     "DEFAULT_PAGINATION_CLASS": "inventario.pagination.Default30Pagination",
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ],
 }
 
 # --------------------------------------------------

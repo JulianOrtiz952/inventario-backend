@@ -24,6 +24,7 @@ from .models import (
     TrasladoProducto, NotaSalidaProducto, InsumoMovimiento,
     ProductoTerminadoMovimiento
 )
+from .filters import InsumoFilter, ProductoFilter
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
@@ -596,6 +597,9 @@ class ProveedorViewSet(viewsets.ModelViewSet):
 class BodegaViewSet(viewsets.ModelViewSet):
     queryset = Bodega.objects.all().order_by("nombre")
     serializer_class = BodegaSerializer
+    filterset_fields = ["ubicacion"]
+    search_fields = ["nombre", "codigo"]
+    ordering_fields = ["nombre", "codigo"]
 
     def get_queryset(self):
         return (
@@ -709,6 +713,8 @@ class BodegaViewSet(viewsets.ModelViewSet):
 class TerceroViewSet(viewsets.ModelViewSet):
     queryset = Tercero.objects.all().order_by("codigo")
     serializer_class = TerceroSerializer
+    search_fields = ["nombre", "codigo"]
+    ordering_fields = ["nombre"]
 
 
 class ImpuestoViewSet(viewsets.ModelViewSet):
@@ -724,6 +730,9 @@ class ProductoViewSet(viewsets.ModelViewSet):
         .order_by("-creado_en")
     )
     serializer_class = ProductoSerializer
+    filterset_class = ProductoFilter
+    search_fields = ["nombre", "codigo_sku", "codigo_barras"]
+    ordering_fields = ["nombre", "creado_en"]
 
     @action(detail=True, methods=["get"], url_path="stock-por-talla")
     def stock_por_talla(self, request, pk=None):
@@ -782,6 +791,9 @@ class DatosAdicionalesProductoViewSet(DebugValidationMixin, viewsets.ModelViewSe
 class InsumoViewSet(viewsets.ModelViewSet):
     queryset = Insumo.objects.select_related("bodega", "proveedor", "tercero").order_by("nombre")
     serializer_class = InsumoSerializer
+    filterset_class = InsumoFilter
+    search_fields = ["nombre", "codigo", "referencia", "observacion"]
+    ordering_fields = ["nombre", "cantidad", "costo_unitario", "creado_en"]
 
     def perform_create(self, serializer):
         insumo = serializer.save()
@@ -865,6 +877,8 @@ class InsumoViewSet(viewsets.ModelViewSet):
 class TallaViewSet(viewsets.ModelViewSet):
     queryset = Talla.objects.all().order_by("nombre")
     serializer_class = TallaSerializer
+    search_fields = ["nombre"]
+    ordering_fields = ["nombre"]
     # (Dejo tu lógica específica fuera por ahora porque en tu código original
     #  estabas llamando self._get_datos_adicionales aquí y eso NO existe en TallaViewSet.
     #  Si esa lógica era para otra cosa, me dices y la reubicamos bien.)
