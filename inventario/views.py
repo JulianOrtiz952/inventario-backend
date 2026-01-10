@@ -4,7 +4,7 @@ from rest_framework.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
 from rest_framework.decorators import action
-from django.db.models import Sum, Count, Q, F, Case, When, DecimalField
+from django.db.models import Sum, Count, Q, F, Case, When, DecimalField, Value, IntegerField
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -760,21 +760,36 @@ class TerceroViewSet(viewsets.ModelViewSet):
 
 
 class ImpuestoViewSet(viewsets.ModelViewSet):
-    queryset = Impuesto.objects.all().order_by("codigo")
+    queryset = Impuesto.objects.all().order_by("-es_activo", "nombre")
     serializer_class = ImpuestoSerializer
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
 
 class ProductoViewSet(viewsets.ModelViewSet):
     queryset = (
         Producto.objects
         .select_related("tercero")
-        .prefetch_related("impuestos", "precios")
-        .order_by("-creado_en")
+        .prefetch_related("impuestos", "precios", "datos_adicionales")
+        .annotate(
+            tiene_bajo_stock=Case(
+                When(datos_adicionales__stock__lt=F("datos_adicionales__stock_minimo"), then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        )
+        .order_by("-es_activo", "tiene_bajo_stock", "-creado_en")
     )
     serializer_class = ProductoSerializer
     filterset_class = ProductoFilter
     search_fields = ["nombre", "codigo_sku", "codigo_barras"]
-    ordering_fields = ["nombre", "creado_en"]
+    ordering_fields = ["nombre", "creado_en", "es_activo"]
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
     @action(detail=True, methods=["get"], url_path="stock-por-talla")
     def stock_por_talla(self, request, pk=None):
@@ -831,8 +846,18 @@ class DatosAdicionalesProductoViewSet(DebugValidationMixin, viewsets.ModelViewSe
 
 
 class InsumoViewSet(viewsets.ModelViewSet):
-    # Ordenar primero por activos vs inactivos (-es_activo: True=1, False=0), luego nombre
-    queryset = Insumo.objects.select_related("bodega", "proveedor", "tercero").order_by("-es_activo", "nombre")
+    # Ordenar primero por activos vs inactivos, luego por bajo stock, luego nombre
+    queryset = (
+        Insumo.objects.select_related("bodega", "proveedor", "tercero")
+        .annotate(
+            tiene_bajo_stock=Case(
+                When(cantidad__lt=F("stock_minimo"), then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        )
+        .order_by("-es_activo", "tiene_bajo_stock", "nombre")
+    )
     serializer_class = InsumoSerializer
     filterset_class = InsumoFilter
     search_fields = ["nombre", "codigo", "referencia", "observacion"]

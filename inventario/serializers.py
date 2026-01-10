@@ -40,7 +40,7 @@ class TerceroSerializer(serializers.ModelSerializer):
 class ImpuestoSerializer(serializers.ModelSerializer):
     class Meta:
         model = Impuesto
-        fields = ["id", "nombre", "codigo", "valor"]
+        fields = ["id", "nombre", "valor", "es_activo"]
 
 
 class PrecioProductoSerializer(serializers.ModelSerializer):
@@ -132,6 +132,7 @@ class ProductoSerializer(serializers.ModelSerializer):
             "precio_total",
             "creado_en",
             "actualizado_en",
+            "es_activo",
         ]
 
     def get_subtotal_sin_impuestos(self, obj):

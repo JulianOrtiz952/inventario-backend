@@ -35,15 +35,15 @@ class Bodega(models.Model):
 
 
 class Impuesto(models.Model):
-    nombre = models.CharField(max_length=100)
-    codigo = models.CharField(max_length=50, unique=True)
+    nombre = models.CharField(max_length=100, unique=True)
     valor = models.DecimalField(
         max_digits=6, decimal_places=2,
         help_text="Porcentaje. Ej: 19.00"
     )
+    es_activo = models.BooleanField(default=True)
 
     def __str__(self):
-        return f"{self.codigo} - {self.nombre} ({self.valor}%)"
+        return f"{self.nombre} ({self.valor}%)"
 
 
 class Producto(models.Model):
@@ -69,6 +69,7 @@ class Producto(models.Model):
 
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)
+    es_activo = models.BooleanField(default=True)
 
     def __str__(self):
         return f"{self.codigo_sku} - {self.nombre}"
