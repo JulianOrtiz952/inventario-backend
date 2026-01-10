@@ -617,8 +617,15 @@ class DebugValidationMixin:
 
 
 class ProveedorViewSet(viewsets.ModelViewSet):
-    queryset = Proveedor.objects.all().order_by("id")
+    # Ordenar por activos primero
+    queryset = Proveedor.objects.all().order_by("-es_activo", "id")
     serializer_class = ProveedorSerializer
+    ordering_fields = ["nombre", "es_activo"]
+
+    def perform_destroy(self, instance):
+        # Soft delete
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
 
 class BodegaViewSet(viewsets.ModelViewSet):
@@ -827,6 +834,32 @@ class InsumoViewSet(viewsets.ModelViewSet):
         # Soft delete: Marcar como inactivo en lugar de borrar
         instance.es_activo = False
         instance.save(update_fields=["es_activo"])
+
+    def perform_update(self, serializer):
+        insumo = serializer.save()
+        # Registrar EDICION en historial (sin afectar stock)
+        tercero = insumo.tercero
+        registrar_movimiento_sin_afectar_stock(
+            insumo=insumo,
+            tercero=tercero,  # puede ser None, pero la función lo maneja o fallará si el modelo lo exige (el modelo InsumoMovimiento.tercero NO es null=True, ojo)
+            # Pero Insumo.tercero es null=True? models.py dice: tercero = models.ForeignKey("Tercero", ..., null=True, blank=True)
+            # InsumoMovimiento.tercero NO es null=True.
+            # Necesitamos un tercero para el historial. Si el insumo no tiene tercero, ¿qué hacemos?
+            # Usar uno por defecto o validar.
+            # REVISAR models.py: InsumoMovimiento line 424: tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT) -> NO NULL.
+            # PROBABLE BUG IF INSUMO HAS NO TERCERO.
+            # Veamos perform_create:
+            #   tercero = insumo.tercero
+            #   if tercero:
+            #       registrar_...
+            # O sea solo registra si tiene tercero. Mantengamos esa lógica.
+            tipo="EDICION",
+            cantidad=Decimal("0.000"),
+            costo_unitario=insumo.costo_unitario,
+            bodega=insumo.bodega,
+            factura=getattr(insumo, "factura", "") or "",
+            observacion="Actualización de datos",
+        ) if insumo.tercero else None
 
     def perform_create(self, serializer):
         insumo = serializer.save()

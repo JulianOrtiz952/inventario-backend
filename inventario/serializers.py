@@ -14,7 +14,7 @@ from django.db.models import Q, Sum
 class ProveedorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Proveedor
-        fields = ["id", "nombre"]
+        fields = ["id", "nombre", "es_activo"]
 
 
 class BodegaSerializer(serializers.ModelSerializer):

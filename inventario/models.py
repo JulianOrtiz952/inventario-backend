@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 
 class Proveedor(models.Model):
     nombre = models.CharField(max_length=100)
+    es_activo = models.BooleanField(default=True)
 
     def __str__(self):
         return self.nombre
@@ -419,6 +420,7 @@ class InsumoMovimiento(models.Model):
         SALIDA = "SALIDA", "Salida"
         CONSUMO_ENSAMBLE = "CONSUMO_ENSAMBLE", "Consumo por ensamble"
         AJUSTE = "AJUSTE", "Ajuste"
+        EDICION = "EDICION", "Edición"
 
     insumo = models.ForeignKey("Insumo", on_delete=models.PROTECT, related_name="movimientos")
     tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT)
