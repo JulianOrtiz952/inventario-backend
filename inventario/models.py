@@ -2,9 +2,10 @@ from django.db import models
 from django.utils import timezone
 from decimal import Decimal
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 
 class Proveedor(models.Model):
-    nombre = models.CharField(max_length=100)
+    nombre = models.CharField(max_length=100, db_index=True)
     es_activo = models.BooleanField(default=True)
 
     def __str__(self):
@@ -13,7 +14,7 @@ class Proveedor(models.Model):
 
 class Tercero(models.Model):
     codigo = models.CharField(max_length=50, unique=True)
-    nombre = models.CharField(max_length=150)
+    nombre = models.CharField(max_length=150, db_index=True)
     es_activo = models.BooleanField(default=True)
 
     def __str__(self):
@@ -22,7 +23,7 @@ class Tercero(models.Model):
 
 class Bodega(models.Model):
     codigo = models.CharField(max_length=50, unique=True)
-    nombre = models.CharField(max_length=100, unique=True)
+    nombre = models.CharField(max_length=100, unique=True, db_index=True)
     descripcion = models.TextField(blank=True)
     ubicacion = models.CharField(max_length=200, blank=True)
     es_activo = models.BooleanField(default=True)
@@ -50,10 +51,10 @@ class Producto(models.Model):
     # ✅ PK: Código_SKU ingresable
     codigo_sku = models.CharField(max_length=50, primary_key=True)
 
-    nombre = models.CharField(max_length=150)
+    nombre = models.CharField(max_length=150, db_index=True)
 
     # ✅ único, puede ser null
-    codigo_barras = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    codigo_barras = models.CharField(max_length=100, unique=True, null=True, blank=True, db_index=True)
 
     # ✅ se guarda como texto (después validamos DIAN si quieres)
     unidad_medida = models.CharField(max_length=50)
@@ -109,12 +110,18 @@ class DatosAdicionalesProducto(models.Model):
 
     referencia = models.CharField(max_length=100, null=True, blank=True)
     unidad = models.CharField(max_length=50, null=True, blank=True)
-    stock = models.DecimalField(              
+    stock = models.DecimalField(
         max_digits=12,
         decimal_places=3,
-        default=0
+        default=0,
+        validators=[MinValueValidator(0)]
     )
-    stock_minimo = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    stock_minimo = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)]
+    )
     descripcion = models.TextField(null=True, blank=True)
     marca = models.CharField(max_length=100, null=True, blank=True)
     modelo = models.CharField(max_length=100, null=True, blank=True)
@@ -154,14 +161,19 @@ class Insumo(models.Model):
     # ✅ PK: Código ingresable
     codigo = models.CharField(max_length=50, primary_key=True)
 
-    nombre = models.CharField(max_length=100)
+    nombre = models.CharField(max_length=100, db_index=True)
     observacion = models.TextField(blank=True, default="")  # antes: descripcion
     factura = models.CharField(max_length=120, blank=True, default="")
 
     # ✅ si no llega, se copia del código; referencia no se puede repetir
     referencia = models.CharField(max_length=50, unique=True)
 
-    stock_minimo = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    stock_minimo = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=0,
+        validators=[MinValueValidator(0)]
+    )
 
     unidad_medida = models.CharField(max_length=10, blank=True, default="")
     color = models.CharField(max_length=50, blank=True, default="")
@@ -172,8 +184,18 @@ class Insumo(models.Model):
         related_name="insumos"
     )
 
-    cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=0)
-    costo_unitario = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cantidad = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=0,
+        validators=[MinValueValidator(0)]
+    )
+    costo_unitario = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)]
+    )
 
     # Proveedor se mantiene (no lo pediste explícito, pero lo dejé porque ya existía)
     proveedor = models.ForeignKey(
@@ -197,7 +219,21 @@ class Insumo(models.Model):
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)
 
+    def clean(self):
+        super().clean()
+        # Si la unidad es "unidad" (o similar), validar que la cantidad sea entera
+        if self.unidad_medida and self.unidad_medida.upper() in ["UN", "UND", "UNIDAD"]:
+            if self.cantidad % 1 != 0:
+                raise ValidationError({
+                    "cantidad": "Los insumos medidos en unidades no pueden tener decimales."
+                })
+            if self.stock_minimo % 1 != 0:
+                raise ValidationError({
+                    "stock_minimo": "El stock mínimo para unidades debe ser un número entero."
+                })
+
     def save(self, *args, **kwargs):
+        self.full_clean()
         # si referencia viene vacía (por seguridad), se setea al código
         if not self.referencia:
             self.referencia = self.codigo

@@ -39,11 +39,9 @@ def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
     signo = +1 descuenta los insumos manuales asociados a la nota
     signo = -1 devuelve (reversa)
     """
-    # Si todavía no tienes el modelo NotaEnsambleInsumo/related_name="insumos", ajusta esto:
+    ins_to_update = []
     for ni in nota.insumos.all():
         cantidad = _d(ni.cantidad) * signo
-
-        # buscar insumo en la bodega de la nota (si tu Insumo es por bodega)
         ins = ni.insumo
         if ins.bodega_id != nota.bodega_id:
             ins = Insumo.objects.filter(codigo=ni.insumo.codigo, bodega=nota.bodega).first()
@@ -52,7 +50,7 @@ def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
             raise ValidationError({"detail": f"Insumo {ni.insumo.codigo} no existe en la bodega de la nota."})
 
         if cantidad > 0 and _d(ins.cantidad) < cantidad:
-            raise ValidationError({
+             raise ValidationError({
                 "stock_insuficiente": {
                     ins.codigo: {
                         "insumo": ins.nombre,
@@ -63,9 +61,11 @@ def consumir_insumos_manuales_por_delta(nota, signo=Decimal("1")):
                 }
             })
 
-        # aplicar delta
         ins.cantidad = _d(ins.cantidad) - cantidad
-        ins.save(update_fields=["cantidad"])
+        ins_to_update.append(ins)
+
+    if ins_to_update:
+        Insumo.objects.bulk_update(ins_to_update, ["cantidad"])
 
 def _decimal(v, field_name):
     try:
@@ -288,88 +288,6 @@ def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
         if insuficientes:
             raise ValidationError({"stock_insuficiente": insuficientes})
 
-    for insumo_obj, requerido in requeridos:
-        delta = abs(_d(requerido))
-        if cantidad_producto > 0:
-            insumo_obj.cantidad = _d(insumo_obj.cantidad) - delta
-        else:
-            insumo_obj.cantidad = _d(insumo_obj.cantidad) + delta
-        insumo_obj.save(update_fields=["cantidad"])
-
-
-from rest_framework import viewsets, status
-from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError
-from decimal import Decimal
-from django.db import transaction
-
-from .models import (
-    Insumo,
-    DatosAdicionalesProducto,
-    NotaEnsamble,
-    ProductoInsumo,
-    NotaEnsambleDetalle,
-    NotaEnsambleInsumo,  # ✅ asegúrate de importarlo
-)
-from .serializers import NotaEnsambleSerializer
-
-
-def _d(x):
-    try:
-        return Decimal(str(x))
-    except Exception:
-        return Decimal("0")
-
-
-def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
-    """
-    cantidad_producto:
-      > 0 => consumir (descontar)
-      < 0 => devolver (revertir)
-    """
-    cantidad_producto = _d(cantidad_producto)
-    if cantidad_producto == 0:
-        return
-
-    lineas_bom = ProductoInsumo.objects.filter(producto=producto).select_related("insumo")
-    if not lineas_bom.exists():
-        return
-
-    insuficientes = {}
-    requeridos = []
-
-    for li in lineas_bom:
-        cpu = _d(li.cantidad_por_unidad)
-        merma = _d(li.merma_porcentaje)
-        requerido = cantidad_producto * cpu * (Decimal("1") + (merma / Decimal("100")))
-
-        insumo_ref = li.insumo
-        if not insumo_ref:
-            insuficientes[li.insumo.codigo] = {
-            "insumo": getattr(li.insumo, "nombre", li.insumo.codigo),
-            "disponible": "0",
-            "requerido": str(abs(requerido)),
-            "faltante": str(abs(requerido)),
-            }
-        continue
-
-        requeridos.append((insumo_ref, requerido))
-
-    # Validación solo si consumimos
-    if cantidad_producto > 0:
-        for insumo_obj, requerido in requeridos:
-            requerido_abs = abs(_d(requerido))
-            disponible = _d(insumo_obj.cantidad)
-            if disponible < requerido_abs:
-                insuficientes[insumo_obj.codigo] = {
-                    "insumo": insumo_obj.nombre,
-                    "disponible": str(disponible),
-                    "requerido": str(requerido_abs),
-                    "faltante": str(requerido_abs - disponible),
-                }
-        if insuficientes:
-            raise ValidationError({"stock_insuficiente": insuficientes})
-
     # Aplicar delta
     for insumo_obj, requerido in requeridos:
         delta = abs(_d(requerido))
@@ -377,7 +295,13 @@ def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
             insumo_obj.cantidad = _d(insumo_obj.cantidad) - delta
         else:
             insumo_obj.cantidad = _d(insumo_obj.cantidad) + delta
-        insumo_obj.save(update_fields=["cantidad"])
+
+    if requeridos:
+        objs = [r[0] for r in requeridos]
+        Insumo.objects.bulk_update(objs, ["cantidad"])
+
+
+
 
 
 class NotaEnsambleViewSet(viewsets.ModelViewSet):

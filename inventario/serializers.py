@@ -74,6 +74,16 @@ class DatosAdicionalesProductoSerializer(serializers.ModelSerializer):
         producto = Producto.objects.get(id=producto_id)
         return DatosAdicionalesProducto.objects.create(producto=producto, **validated_data)
 
+    def validate_stock(self, value):
+        if value < 0:
+            raise serializers.ValidationError("El stock no puede ser negativo.")
+        return value
+
+    def validate_stock_minimo(self, value):
+        if value < 0:
+            raise serializers.ValidationError("El stock mínimo no puede ser negativo.")
+        return value
+
     def update(self, instance, validated_data):
         instance.referencia = validated_data.get('referencia', instance.referencia)
         instance.unidad = validated_data.get('unidad', instance.unidad)
@@ -186,6 +196,24 @@ class InsumoSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True
     )
+
+    def validate(self, data):
+        cantidad = data.get("cantidad")
+        stock_minimo = data.get("stock_minimo")
+        unidad_medida = data.get("unidad_medida") or (self.instance.unidad_medida if self.instance else None)
+
+        if cantidad is not None and cantidad < 0:
+            raise serializers.ValidationError({"cantidad": "La cantidad no puede ser negativa."})
+        if stock_minimo is not None and stock_minimo < 0:
+            raise serializers.ValidationError({"stock_minimo": "El stock mínimo no puede ser negativo."})
+
+        if unidad_medida and unidad_medida.upper() in ["UN", "UND", "UNIDAD"]:
+            if cantidad is not None and cantidad % 1 != 0:
+                raise serializers.ValidationError({"cantidad": "Los insumos medidos en unidades no pueden tener decimales."})
+            if stock_minimo is not None and stock_minimo % 1 != 0:
+                raise serializers.ValidationError({"stock_minimo": "El stock mínimo para unidades debe ser un número entero."})
+
+        return data
 
     class Meta:
         model = Insumo
