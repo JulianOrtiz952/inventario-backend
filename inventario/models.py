@@ -14,6 +14,7 @@ class Proveedor(models.Model):
 class Tercero(models.Model):
     codigo = models.CharField(max_length=50, unique=True)
     nombre = models.CharField(max_length=150)
+    es_activo = models.BooleanField(default=True)
 
     def __str__(self):
         return f"{self.codigo} - {self.nombre}"
@@ -21,9 +22,10 @@ class Tercero(models.Model):
 
 class Bodega(models.Model):
     codigo = models.CharField(max_length=50, unique=True)
-    nombre = models.CharField(max_length=100)
+    nombre = models.CharField(max_length=100, unique=True)
     descripcion = models.TextField(blank=True)
     ubicacion = models.CharField(max_length=200, blank=True)
+    es_activo = models.BooleanField(default=True)
 
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)
@@ -141,6 +143,7 @@ class PrecioProducto(models.Model):
 
 class Talla(models.Model):
     nombre = models.CharField(max_length=50, unique=True)
+    es_activo = models.BooleanField(default=True)
 
     def __str__(self):
         return self.nombre

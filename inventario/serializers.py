@@ -26,14 +26,15 @@ class BodegaSerializer(serializers.ModelSerializer):
         fields = [
             "id", "codigo", "nombre", "descripcion", "ubicacion",
             "insumos_count", "productos_count",
-            "creado_en", "actualizado_en"
+            "creado_en", "actualizado_en",
+            "es_activo"
         ]
 
 
 class TerceroSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tercero
-        fields = ["id", "codigo", "nombre"]
+        fields = ["id", "codigo", "nombre", "es_activo"]
 
 
 class ImpuestoSerializer(serializers.ModelSerializer):
@@ -239,7 +240,7 @@ class InsumoSerializer(serializers.ModelSerializer):
 class TallaSerializer(serializers.ModelSerializer):
     class Meta:
         model = Talla
-        fields = ["id", "nombre"]
+        fields = ["id", "nombre", "es_activo"]
 
 
 class ProductoInsumoSerializer(serializers.ModelSerializer):

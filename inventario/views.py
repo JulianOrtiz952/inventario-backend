@@ -629,11 +629,15 @@ class ProveedorViewSet(viewsets.ModelViewSet):
 
 
 class BodegaViewSet(viewsets.ModelViewSet):
-    queryset = Bodega.objects.all().order_by("nombre")
+    queryset = Bodega.objects.all().order_by("-es_activo", "nombre")
     serializer_class = BodegaSerializer
     filterset_fields = ["ubicacion"]
     search_fields = ["nombre", "codigo"]
-    ordering_fields = ["nombre", "codigo"]
+    ordering_fields = ["nombre", "codigo", "es_activo"]
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
     def get_queryset(self):
         return (
@@ -745,10 +749,14 @@ class BodegaViewSet(viewsets.ModelViewSet):
 
 
 class TerceroViewSet(viewsets.ModelViewSet):
-    queryset = Tercero.objects.all().order_by("codigo")
+    queryset = Tercero.objects.all().order_by("-es_activo", "codigo")
     serializer_class = TerceroSerializer
     search_fields = ["nombre", "codigo"]
-    ordering_fields = ["nombre"]
+    ordering_fields = ["nombre", "es_activo"]
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
 
 
 class ImpuestoViewSet(viewsets.ModelViewSet):
@@ -992,10 +1000,14 @@ class InsumoViewSet(viewsets.ModelViewSet):
 
 
 class TallaViewSet(viewsets.ModelViewSet):
-    queryset = Talla.objects.all().order_by("nombre")
+    queryset = Talla.objects.all().order_by("-es_activo", "nombre")
     serializer_class = TallaSerializer
     search_fields = ["nombre"]
-    ordering_fields = ["nombre"]
+    ordering_fields = ["nombre", "es_activo"]
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
     # (Dejo tu lógica específica fuera por ahora porque en tu código original
     #  estabas llamando self._get_datos_adicionales aquí y eso NO existe en TallaViewSet.
     #  Si esa lógica era para otra cosa, me dices y la reubicamos bien.)
@@ -1026,6 +1038,128 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
                 Q(bodega_destino_id=bodega_id)
             )
         return qs
+
+    @action(detail=False, methods=["post"], url_path="ejecutar-masivo")
+    @transaction.atomic
+    def ejecutar_masivo(self, request):
+        """
+        Payload:
+        {
+          "tercero_id": 1,
+          "bodega_origen_id": 2,
+          "bodega_destino_id": 3,
+          "items": [
+             { "producto_id": "SKU", "talla_id": 5, "cantidad": "2" },
+             ...
+          ]
+        }
+        """
+        data = request.data
+        tercero_id = data.get("tercero_id")
+        origen_id = data.get("bodega_origen_id")
+        destino_id = data.get("bodega_destino_id")
+        items = data.get("items", [])
+
+        if not items:
+            raise ValidationError({"items": "La lista de items está vacía."})
+
+        if origen_id == destino_id:
+            raise ValidationError({"bodega_destino_id": "Destino debe ser diferente a origen."})
+
+        tercero = get_object_or_404(Tercero, pk=tercero_id)
+        b_origen = get_object_or_404(Bodega, pk=origen_id)
+        b_destino = get_object_or_404(Bodega, pk=destino_id)
+
+        ok_count = 0
+        
+        for item in items:
+            sku = item.get("producto_id")
+            talla_id = item.get("talla_id")
+            cantidad_str = item.get("cantidad")
+            
+            try:
+                producto = Producto.objects.get(codigo_sku=sku)
+            except Producto.DoesNotExist:
+                raise ValidationError(f"Producto {sku} no existe.")
+
+            talla = None
+            if talla_id:
+                talla = Talla.objects.get(pk=talla_id)
+
+            cantidad = _d(cantidad_str)
+            if cantidad <= 0:
+                raise ValidationError(f"Cantidad inválida para {sku}.")
+
+            # --- Lógica de traslado (reutilizada de 'ejecutar') ---
+            qs = (
+                NotaEnsambleDetalle.objects
+                .select_related("nota", "nota__bodega", "bodega_actual")
+                .annotate(bodega_efectiva=Coalesce("bodega_actual_id", "nota__bodega_id"))
+                .filter(producto=producto)
+                .filter(bodega_efectiva=b_origen.id)
+                .order_by("nota__fecha_elaboracion", "id")
+            )
+
+            if talla is None:
+                qs = qs.filter(talla__isnull=True)
+            else:
+                qs = qs.filter(talla=talla)
+            
+            # Bloquear filas para evitar race conditions
+            qs = qs.select_for_update()
+
+            disponible_total = sum(_d(x.cantidad) for x in qs)
+            if disponible_total < cantidad:
+                talla_nombre = talla.nombre if talla else "Única"
+                raise ValidationError({
+                    "stock_insuficiente": {
+                        "producto": f"{producto.nombre} ({talla_nombre})",
+                        "disponible": str(disponible_total),
+                        "requerido": str(cantidad),
+                        "faltante": str(cantidad - disponible_total),
+                    }
+                })
+
+            restante = cantidad
+            for det in qs:
+                if restante <= 0: 
+                    break
+                
+                disponible_det = _d(det.cantidad)
+                mover = min(disponible_det, restante)
+                if mover <= 0:
+                    continue
+                
+                # 1. Restar origen
+                det.cantidad = disponible_det - mover
+                det.save(update_fields=["cantidad"])
+
+                # 2. Sumar destino
+                dest_det, _created = NotaEnsambleDetalle.objects.get_or_create(
+                    nota=det.nota,
+                    producto=det.producto,
+                    talla=det.talla,
+                    bodega_actual=b_destino,
+                    defaults={"cantidad": Decimal("0")}
+                )
+                dest_det.cantidad = _d(dest_det.cantidad) + mover
+                dest_det.save(update_fields=["cantidad"])
+
+                # 3. Historial
+                TrasladoProducto.objects.create(
+                    tercero=tercero,
+                    bodega_origen=b_origen,
+                    bodega_destino=b_destino,
+                    producto=producto,
+                    talla=talla,
+                    cantidad=mover,
+                    detalle=det
+                )
+                restante -= mover
+            
+            ok_count += 1
+
+        return Response({"ok": True, "items_movidos": ok_count}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"], url_path="ejecutar")
     @transaction.atomic
