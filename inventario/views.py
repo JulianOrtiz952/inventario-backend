@@ -1,4 +1,5 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from decimal import Decimal
@@ -21,10 +22,10 @@ from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla,
     NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo,
-    TrasladoProducto, NotaSalidaProducto, InsumoMovimiento,
+    TrasladoProducto, NotaSalidaProducto, NotaSalidaAfectacionStock, InsumoMovimiento,
     ProductoTerminadoMovimiento
 )
-from .filters import InsumoFilter, ProductoFilter
+from .filters import InsumoFilter, ProductoFilter, NotaEnsambleFilter
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
@@ -242,7 +243,72 @@ def _d(x):
     except Exception:
         return Decimal("0")
 
-def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
+def descontar_insumo_global(codigo, cantidad_total, bodega_preferida, tercero=None, nota_ensamble=None, tipo_movimiento=None, observacion_p=None):
+    """
+    Descuenta stock de un insumo (por código) buscando en múltiples bodegas.
+    Prioriza la bodega_preferida.
+    """
+    if tipo_movimiento is None:
+        tipo_movimiento = InsumoMovimiento.Tipo.CONSUMO_ENSAMBLE
+
+    cantidad_total = _d(cantidad_total)
+    if cantidad_total <= 0:
+        return
+
+    # 1. Verificar stock total global
+    total_global = Insumo.objects.filter(codigo=codigo, es_activo=True).aggregate(total=Sum('cantidad'))['total'] or Decimal('0')
+    if total_global < cantidad_total:
+        ins_ej = Insumo.objects.filter(codigo=codigo).first()
+        nombre = ins_ej.nombre if ins_ej else codigo
+        raise ValidationError({
+            "stock_insuficiente": {
+                codigo: {
+                    "insumo": nombre,
+                    "disponible": str(total_global),
+                    "requerido": str(cantidad_total),
+                    "faltante": str(cantidad_total - total_global),
+                }
+            }
+        })
+
+    # 2. Descontar priorizando bodega_preferida
+    insumos_qs = Insumo.objects.filter(codigo=codigo, es_activo=True).order_by(
+        Case(When(bodega=bodega_preferida, then=Value(0)), default=Value(1)),
+        '-cantidad'
+    )
+
+    restante = cantidad_total
+    for ins in insumos_qs:
+        if restante <= 0:
+            break
+        cant_en_bodega = _d(ins.cantidad)
+        if cant_en_bodega <= 0:
+            continue
+            
+        a_descontar = min(cant_en_bodega, restante)
+        nueva_cant = _round3(cant_en_bodega - a_descontar)
+        ins.cantidad = nueva_cant
+        ins.save(update_fields=['cantidad'])
+
+        # ✅ Registrar movimiento en Kardex para esta bodega
+        obs_mov = observacion_p or f"Consumo automático [{ins.bodega.nombre}] por nota #{getattr(nota_ensamble, 'id', 'S/N')}"
+        registrar_movimiento_sin_afectar_stock(
+            insumo=ins,
+            tercero=tercero or getattr(nota_ensamble, "tercero", None),
+            bodega=ins.bodega,
+            tipo=tipo_movimiento,
+            cantidad=a_descontar,
+            costo_unitario=ins.costo_unitario,
+            nota_ensamble=nota_ensamble,
+            observacion=obs_mov
+        )
+
+        restante -= a_descontar
+
+def _round3(d):
+    return _d(d).quantize(Decimal('0.001'))
+
+def consumir_insumos_por_delta(producto, bodega, cantidad_producto, nota_ensamble=None, observacion_p=None):
     cantidad_producto = _d(cantidad_producto)
     if cantidad_producto == 0:
         return
@@ -251,54 +317,43 @@ def consumir_insumos_por_delta(producto, bodega, cantidad_producto):
     if not lineas_bom.exists():
         return
 
-    insuficientes = {}
-    requeridos = []
-
     for li in lineas_bom:
         cpu = _d(li.cantidad_por_unidad)
         merma = _d(li.merma_porcentaje)
         requerido = cantidad_producto * cpu * (Decimal("1") + (merma / Decimal("100")))
 
-        insumo_ref = li.insumo
-        if insumo_ref.bodega_id != bodega.id:
-            insumo_ref = Insumo.objects.filter(codigo=li.insumo.codigo, bodega=bodega).first()
-
-        if not insumo_ref:
-            insuficientes[li.insumo.codigo] = {
-                "insumo": getattr(li.insumo, "nombre", li.insumo.codigo),
-                "disponible": "0",
-                "requerido": str(abs(requerido)),
-                "faltante": str(abs(requerido)),
-            }
-            continue
-
-        requeridos.append((insumo_ref, requerido))
-
-    if cantidad_producto > 0:
-        for insumo_obj, requerido in requeridos:
-            requerido_abs = abs(_d(requerido))
-            disponible = _d(insumo_obj.cantidad)
-            if disponible < requerido_abs:
-                insuficientes[insumo_obj.codigo] = {
-                    "insumo": insumo_obj.nombre,
-                    "disponible": str(disponible),
-                    "requerido": str(requerido_abs),
-                    "faltante": str(requerido_abs - disponible),
-                }
-        if insuficientes:
-            raise ValidationError({"stock_insuficiente": insuficientes})
-
-    # Aplicar delta
-    for insumo_obj, requerido in requeridos:
-        delta = abs(_d(requerido))
         if cantidad_producto > 0:
-            insumo_obj.cantidad = _d(insumo_obj.cantidad) - delta
+            # Consumir (multi-bodega)
+            descontar_insumo_global(
+                li.insumo.codigo, 
+                requerido, 
+                bodega, 
+                nota_ensamble=nota_ensamble,
+                tipo_movimiento=InsumoMovimiento.Tipo.CONSUMO_ENSAMBLE,
+                observacion_p=observacion_p
+            )
         else:
-            insumo_obj.cantidad = _d(insumo_obj.cantidad) + delta
+            # Reversar (devolver a la bodega de la nota)
+            can_abs = abs(requerido)
+            ins_pref = Insumo.objects.filter(codigo=li.insumo.codigo, bodega=bodega).first()
+            if not ins_pref:
+                ins_pref = li.insumo
+            
+            ins_pref.cantidad = _round3(_d(ins_pref.cantidad) + can_abs)
+            ins_pref.save(update_fields=['cantidad'])
 
-    if requeridos:
-        objs = [r[0] for r in requeridos]
-        Insumo.objects.bulk_update(objs, ["cantidad"])
+            # ✅ Registrar movimiento de reversión
+            obs_mov = observacion_p or f"Reversión de consumo (BOM) por nota #{getattr(nota_ensamble, 'id', 'S/N')}"
+            registrar_movimiento_sin_afectar_stock(
+                insumo=ins_pref,
+                tercero=getattr(nota_ensamble, "tercero", None),
+                bodega=ins_pref.bodega,
+                tipo=InsumoMovimiento.Tipo.AJUSTE,
+                cantidad=can_abs,
+                costo_unitario=ins_pref.costo_unitario,
+                nota_ensamble=nota_ensamble,
+                observacion=obs_mov
+            )
 
 
 
@@ -312,6 +367,15 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         .order_by("-id")
     )
     serializer_class = NotaEnsambleSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = NotaEnsambleFilter
+    search_fields = [
+        "observaciones", 
+        "tercero__nombre", 
+        "detalles__producto__nombre", 
+        "detalles__producto__codigo_sku"
+    ]
+    ordering_fields = ["id", "fecha_elaboracion", "creado_en"]
 
     def _get_datos_adicionales(self, producto):
         datos = DatosAdicionalesProducto.objects.filter(producto=producto).first()
@@ -336,7 +400,7 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         # ✅ sumatoria de cantidades de productos terminados
         return sum(_d(d.cantidad) for d in nota.detalles.all())
 
-    def _aplicar_detalles(self, nota, detalles, signo=Decimal("1")):
+    def _aplicar_detalles(self, nota, detalles, signo=Decimal("1"), observacion_p=None):
         """
         Aplica o revierte:
         - Consumo por receta (BOM)
@@ -347,14 +411,14 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
             cantidad = _d(det.cantidad) * signo
 
             # BOM
-            consumir_insumos_por_delta(producto, nota.bodega, cantidad)
+            consumir_insumos_por_delta(producto, nota.bodega, cantidad, nota_ensamble=nota, observacion_p=observacion_p)
 
             # Stock producto terminado
             datos = self._get_datos_adicionales(producto)
             datos.stock = _d(datos.stock) + cantidad
             datos.save(update_fields=["stock"])
 
-    def _aplicar_insumos_manuales(self, nota, signo=Decimal("1")):
+    def _aplicar_insumos_manuales(self, nota, signo=Decimal("1"), observacion_p=None):
         """
         Interpreta ni.cantidad como: cantidad POR UNIDAD de producto terminado.
         Entonces descuenta/devuelve: (ni.cantidad * total_productos_en_nota) * signo
@@ -366,30 +430,38 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         for ni in nota.insumos.all():
             cant_total = _d(ni.cantidad) * _d(total_productos) * signo
 
-            ins = ni.insumo
-
-            if not ins:
-                raise ValidationError({"detail": f"Insumo {ni.insumo.codigo} no existe en la bodega de la nota."})
-
             if cant_total > 0:
-                disponible = _d(ins.cantidad)
-                if disponible < cant_total:
-                    raise ValidationError({
-                        "stock_insuficiente": {
-                            ins.codigo: {
-                                "insumo": ins.nombre,
-                                "disponible": str(disponible),
-                                "requerido": str(cant_total),
-                                "faltante": str(cant_total - disponible),
-                            }
-                        }
-                    })
-                ins.cantidad = disponible - cant_total
+                # Consumir (multi-bodega)
+                descontar_insumo_global(
+                    ni.insumo.codigo, 
+                    cant_total, 
+                    nota.bodega, 
+                    tercero=nota.tercero, 
+                    nota_ensamble=nota,
+                    observacion_p=observacion_p
+                )
             else:
-                # devolver
-                ins.cantidad = _d(ins.cantidad) + abs(_d(cant_total))
+                # Reversar (devolver a la bodega de la nota)
+                can_abs = abs(cant_total)
+                ins_pref = Insumo.objects.filter(codigo=ni.insumo.codigo, bodega=nota.bodega).first()
+                if not ins_pref:
+                    ins_pref = ni.insumo
+                
+                ins_pref.cantidad = _round3(_d(ins_pref.cantidad) + can_abs)
+                ins_pref.save(update_fields=['cantidad'])
 
-            ins.save(update_fields=["cantidad"])
+                # ✅ Registrar movimiento de reversión
+                obs_mov = observacion_p or f"Reversión de consumo manual por nota #{nota.id}"
+                registrar_movimiento_sin_afectar_stock(
+                    insumo=ins_pref,
+                    tercero=nota.tercero,
+                    bodega=ins_pref.bodega,
+                    tipo=InsumoMovimiento.Tipo.AJUSTE,
+                    cantidad=can_abs,
+                    costo_unitario=ins_pref.costo_unitario,
+                    nota_ensamble=nota,
+                    observacion=obs_mov
+                )
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -427,85 +499,133 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def update(self, request, *args, **kwargs):
         """
-        Flujo correcto:
-        1) Revertir TODO (lo viejo)
-        2) Guardar cabecera
-        3) Reemplazar detalles + insumos manuales
-        4) Aplicar TODO (lo nuevo)
+        Permite edición parcial segura:
+        - Si solo se edita metadata (fecha, observaciones, tercero), se permite siempre.
+        - Si se cambia stock/receta (cantidades, productos, insumos manuales, bodega),
+          se bloquea si existen ventas o traslados asociados.
         """
         nota = self.get_object()
+        data = request.data
 
-            # 🚫 Bloquear si hay detalles fuera de la bodega original de la nota
-        if nota.detalles.exclude(bodega_actual=nota.bodega).exists():
-            raise ValidationError({
-                "detail": (
-                    "Esta nota tiene productos trasladados a otra bodega. "
-                    "Para evitar inconsistencias, esta nota no se puede editar. "
-                    "Crea una nueva nota o revierte los traslados antes de editar."
-                ),
-                "code": "NOTA_CON_TRASLADOS"
-            })
+        # 1. Identificar cambios críticos
+        has_detalles_input = "detalles_input" in data
+        has_insumos_input = "insumos_input" in data
+        has_bodega_change = "bodega_id" in data and int(data["bodega_id"]) != nota.bodega_id
 
-        # 1) Revertir lo anterior (BOM/stock + manuales)
-        self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"))
-        self._aplicar_insumos_manuales(nota, signo=Decimal("-1"))
+        is_critical_change = has_detalles_input or has_insumos_input or has_bodega_change
 
-        # 2) Validar payload
-        serializer = self.get_serializer(nota, data=request.data, partial=False)
-        serializer.is_valid(raise_exception=True)
+        # 2. Si es un cambio crítico, validar seguridad
+        if is_critical_change:
+            # 🚫 Bloquear si hay productos en otra bodega (solo si bodega_actual no es null y es distinta a la original)
+            details_in_other_bodega = nota.detalles.filter(bodega_actual__isnull=False).exclude(bodega_actual_id=nota.bodega_id).exists()
+            if details_in_other_bodega:
+                raise ValidationError({
+                    "detail": (
+                        "Esta nota tiene productos trasladados a otra bodega. "
+                        "Para cambiar cantidades o productos, debes revertir los traslados."
+                    ),
+                    "code": "NOTA_CON_TRASLADOS"
+                })
 
-        detalles_data = serializer.validated_data.pop("detalles_input", [])
-        if not detalles_data:
-            raise ValidationError({"detalles_input": "Debe enviar al menos un detalle."})
+            # 🚫 Bloquear si hay ventas (afectaciones)
+            if NotaSalidaAfectacionStock.objects.filter(detalle_stock__nota=nota).exists():
+                raise ValidationError({
+                    "detail": (
+                        "Esta nota tiene productos vendidos (notas de salida). "
+                        "Para cambiar cantidades o productos, debes eliminar las notas de salida asociadas."
+                    ),
+                    "code": "NOTA_CON_SALIDAS"
+                })
 
-        # ✅ MUY IMPORTANTE: sacar insumos_input aquí para que no rompa serializer.save()
-        insumos_data = serializer.validated_data.pop("insumos_input", [])
+            # 🚫 Bloquear si hay historial de traslados relacionado a sus detalles
+            if TrasladoProducto.objects.filter(detalle__nota=nota).exists():
+                raise ValidationError({
+                    "detail": (
+                        "Esta nota tiene historial de traslados. "
+                        "Revierta los traslados antes de modificar productos o cantidades."
+                    ),
+                    "code": "NOTA_CON_HISTORIAL_TRASLADOS"
+                })
 
-        # 3) Guardar cabecera
-        nota = serializer.save()
+            # FLUJO CRÍTICO: Revertir anterior y aplicar nuevo
+            # 1) Revertir lo anterior (BOM/stock + manuales)
+            self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"))
+            self._aplicar_insumos_manuales(nota, signo=Decimal("-1"))
 
-        # 4) Reemplazar detalles
-        nota.detalles.all().delete()
-        NotaEnsambleDetalle.objects.bulk_create(
-            [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
-        )
+            # 1b) Limpiar historial de movimientos de esta nota para que no se acumule
+            InsumoMovimiento.objects.filter(nota_ensamble=nota).delete()
 
-        # 5) Reemplazar insumos manuales (si no vienen => queda vacío => “se quitaron”)
-        nota.insumos.all().delete()
-        if insumos_data:
-            objs = []
-            # resolver insumos por código (más eficiente)
-            codigos = [i["insumo_codigo"] for i in insumos_data]
-            mapa = {x.codigo: x for x in Insumo.objects.filter(codigo__in=codigos)}
-            for i in insumos_data:
-                ins = mapa.get(i["insumo_codigo"])
-                if not ins:
-                    raise ValidationError({"insumos_input": f"Insumo {i['insumo_codigo']} no existe."})
-                objs.append(NotaEnsambleInsumo(
-                    nota=nota,
-                    insumo=ins,
-                    cantidad=i["cantidad"]
-                ))
-            NotaEnsambleInsumo.objects.bulk_create(objs)
+            # 2) Validar payload
+            serializer = self.get_serializer(nota, data=data, partial=True)
+            serializer.is_valid(raise_exception=True)
 
-        nota.refresh_from_db()
+            detalles_data = serializer.validated_data.pop("detalles_input", None)
+            insumos_data = serializer.validated_data.pop("insumos_input", None)
 
-        # 6) Aplicar lo nuevo
-        self._aplicar_detalles(nota, nota.detalles.all(), signo=Decimal("1"))
-        self._aplicar_insumos_manuales(nota, signo=Decimal("1"))
+            # 3) Guardar cabecera
+            nota = serializer.save()
+
+            # 4) Reemplazar detalles si vienen
+            if detalles_data is not None:
+                nota.detalles.all().delete()
+                NotaEnsambleDetalle.objects.bulk_create(
+                    [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
+                )
+
+            # 5) Reemplazar insumos manuales si vienen
+            if insumos_data is not None:
+                nota.insumos.all().delete()
+                objs = []
+                codigos = [i["insumo_codigo"] for i in insumos_data]
+                mapa = {x.codigo: x for x in Insumo.objects.filter(codigo__in=codigos)}
+                for i in insumos_data:
+                    ins = mapa.get(i["insumo_codigo"])
+                    if not ins:
+                        raise ValidationError({"insumos_input": f"Insumo {i['insumo_codigo']} no existe."})
+                    objs.append(NotaEnsambleInsumo(
+                        nota=nota,
+                        insumo=ins,
+                        cantidad=i["cantidad"]
+                    ))
+                NotaEnsambleInsumo.objects.bulk_create(objs)
+
+            nota.refresh_from_db()
+
+            # 6) Aplicar lo nuevo
+            self._aplicar_detalles(nota, nota.detalles.all(), signo=Decimal("1"))
+            self._aplicar_insumos_manuales(nota, signo=Decimal("1"))
+
+        else:
+            # FLUJO SEGURO (METADATA): Solo guardar cabecera
+            serializer = self.get_serializer(nota, data=data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            nota = serializer.save()
 
         return Response(self.get_serializer(nota).data, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         """
-        1) Revertir TODO
-        2) Eliminar
+        Bloquea eliminación si hay registrados movimientos que dependan de esta nota.
         """
         nota = self.get_object()
 
-        self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"))
-        self._aplicar_insumos_manuales(nota, signo=Decimal("-1"))
+        # Validaciones de seguridad para eliminación
+        # 🚫 Solo bloquear si bodega_actual es No Nulo Y Distinto a la bodega original
+        details_in_other_bodega = nota.detalles.filter(bodega_actual__isnull=False).exclude(bodega_actual_id=nota.bodega_id).exists()
+        if details_in_other_bodega:
+            raise ValidationError({"detail": "No se puede eliminar: tiene productos en otras bodegas."})
+
+        if NotaSalidaAfectacionStock.objects.filter(detalle_stock__nota=nota).exists():
+            raise ValidationError({"detail": "No se puede eliminar: ya tiene productos vendidos."})
+        
+        if TrasladoProducto.objects.filter(detalle__nota=nota).exists():
+            raise ValidationError({"detail": "No se puede eliminar: tiene historial de traslados."})
+
+        # Revertir stock antes de borrar, dejando una traza en el historial
+        obs_del = f"Eliminación nota #{nota.id}"
+        self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"), observacion_p=obs_del)
+        self._aplicar_insumos_manuales(nota, signo=Decimal("-1"), observacion_p=obs_del)
 
         return super().destroy(request, *args, **kwargs)
   
