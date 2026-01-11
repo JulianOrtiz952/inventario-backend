@@ -2,7 +2,7 @@ import django_filters
 from decimal import Decimal
 from django.db.models import Sum, F, DecimalField, OuterRef, Subquery, ExpressionWrapper, Value
 from django.db.models.functions import Coalesce
-from .models import Insumo, Producto, PrecioProducto, Impuesto, NotaEnsamble
+from .models import Insumo, Producto, PrecioProducto, Impuesto, NotaEnsamble, NotaSalidaProducto
 
 class InsumoFilter(django_filters.FilterSet):
     costo_unitario_min = django_filters.NumberFilter(field_name="costo_unitario", lookup_expr="gte")
@@ -94,4 +94,12 @@ class NotaEnsambleFilter(django_filters.FilterSet):
 
     class Meta:
         model = NotaEnsamble
+        fields = ["bodega", "tercero"]
+
+class NotaSalidaProductoFilter(django_filters.FilterSet):
+    fecha_inicio = django_filters.DateFilter(field_name="fecha", lookup_expr="gte")
+    fecha_fin = django_filters.DateFilter(field_name="fecha", lookup_expr="lte")
+
+    class Meta:
+        model = NotaSalidaProducto
         fields = ["bodega", "tercero"]

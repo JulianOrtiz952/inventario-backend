@@ -25,7 +25,7 @@ from .models import (
     TrasladoProducto, NotaSalidaProducto, NotaSalidaAfectacionStock, InsumoMovimiento,
     ProductoTerminadoMovimiento
 )
-from .filters import InsumoFilter, ProductoFilter, NotaEnsambleFilter
+from .filters import InsumoFilter, ProductoFilter, NotaEnsambleFilter, NotaSalidaProductoFilter
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
@@ -721,9 +721,9 @@ class BodegaViewSet(viewsets.ModelViewSet):
             qs = qs.filter(producto__codigo_sku=sku)
 
         data = (
-            qs.values("producto__codigo_sku", "producto__nombre", "talla")
+            qs.values("producto__codigo_sku", "producto__nombre", "talla__nombre")
               .annotate(cantidad=Sum("cantidad"))
-              .order_by("producto__codigo_sku", "talla")
+              .order_by("producto__codigo_sku", "talla__nombre")
         )
 
         # Normaliza keys a lo que el front consume fácil
@@ -731,7 +731,7 @@ class BodegaViewSet(viewsets.ModelViewSet):
             {
                 "producto_id": row["producto__codigo_sku"],
                 "producto_nombre": row["producto__nombre"],
-                "talla": row["talla"] or "",
+                "talla": row["talla__nombre"] or "",
                 "cantidad": str(row["cantidad"] or 0),
                 "bodega_id": bodega.id,
                 "bodega_nombre": bodega.nombre,
@@ -855,7 +855,7 @@ class ProductoViewSet(viewsets.ModelViewSet):
             qs = qs.filter(bodega_efectiva=int(bodega_id))
 
         items = (
-            qs.values("talla__id", "talla__nombre")
+            qs.values("talla__nombre")
             .annotate(cantidad=Sum("cantidad"))
             .order_by("talla__nombre")
         )
@@ -870,7 +870,7 @@ class ProductoViewSet(viewsets.ModelViewSet):
                 {
                     "codigo": producto.codigo_sku,
                     "nombre": producto.nombre,
-                    "talla_id": it["talla__id"],
+                    "talla_id": it["talla__nombre"],
                     "talla": it["talla__nombre"] or "Sin talla",
                     "cantidad": str(it["cantidad"] or 0),
                 }
@@ -1071,6 +1071,7 @@ class InsumoViewSet(viewsets.ModelViewSet):
 class TallaViewSet(viewsets.ModelViewSet):
     queryset = Talla.objects.all().order_by("-es_activo", "nombre")
     serializer_class = TallaSerializer
+    lookup_field = "nombre"
     search_fields = ["nombre"]
     ordering_fields = ["nombre", "es_activo"]
 
@@ -1333,8 +1334,31 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({"ok": True, "cantidad_movida": str(cantidad)}, status=status.HTTP_200_OK)
 
 class NotaSalidaProductoViewSet(viewsets.ModelViewSet):
-    queryset = NotaSalidaProducto.objects.all().prefetch_related("detalles", "detalles__afectaciones")
+    queryset = NotaSalidaProducto.objects.all().prefetch_related("detalles", "detalles__afectaciones", "bodega", "tercero")
     serializer_class = NotaSalidaProductoSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = NotaSalidaProductoFilter
+    search_fields = ["numero", "observacion", "detalles__producto__nombre", "detalles__producto__codigo_sku"]
+    ordering_fields = ["id", "fecha", "creado_en"]
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        # Revertir stock: devolver a las NotaEnsambleDetalle originales y al global
+        for detalle in instance.detalles.all():
+            # 1. Devolver a la bodega (FIFO afectaciones)
+            for afectacion in detalle.afectaciones.all():
+                stock_row = afectacion.detalle_stock
+                stock_row.cantidad = (stock_row.cantidad + afectacion.cantidad)
+                stock_row.save(update_fields=["cantidad"])
+            
+            # 2. Devolver al global
+            datos = DatosAdicionalesProducto.objects.filter(producto=detalle.producto).first()
+            if datos:
+                datos.stock = (datos.stock + detalle.cantidad)
+                datos.save(update_fields=["stock"])
+        
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=["get"], url_path="pdf")
     def pdf(self, request, pk=None):

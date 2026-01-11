@@ -2,7 +2,7 @@ from django.db import models
 from django.utils import timezone
 from decimal import Decimal
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, RegexValidator
 
 class Proveedor(models.Model):
     nombre = models.CharField(max_length=100, db_index=True)
@@ -150,8 +150,28 @@ class PrecioProducto(models.Model):
 
 
 class Talla(models.Model):
-    nombre = models.CharField(max_length=50, unique=True)
+    nombre = models.CharField(
+        max_length=50, 
+        unique=True,
+        validators=[
+            RegexValidator(
+                regex=r'^[a-zA-Z0-9]+$',
+                message='El nombre de la talla solo puede contener letras y números.',
+                code='invalid_nombre'
+            )
+        ]
+    )
     es_activo = models.BooleanField(default=True)
+
+    def clean(self):
+        if self.nombre:
+            self.nombre = self.nombre.upper()
+        super().clean()
+
+    def save(self, *args, **kwargs):
+        if self.nombre:
+            self.nombre = self.nombre.upper()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.nombre

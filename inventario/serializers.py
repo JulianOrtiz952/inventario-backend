@@ -269,7 +269,7 @@ class InsumoSerializer(serializers.ModelSerializer):
 class TallaSerializer(serializers.ModelSerializer):
     class Meta:
         model = Talla
-        fields = ["id", "nombre", "es_activo"]
+        fields = ["nombre", "es_activo"]
 
 
 class ProductoInsumoSerializer(serializers.ModelSerializer):
@@ -312,7 +312,13 @@ class NotaEnsambleDetalleSerializer(serializers.ModelSerializer):
 
 class NotaEnsambleDetalleWriteSerializer(serializers.ModelSerializer):
     producto_id = serializers.PrimaryKeyRelatedField(queryset=Producto.objects.all(), source="producto")
-    talla_id = serializers.PrimaryKeyRelatedField(queryset=Talla.objects.all(), source="talla", required=False, allow_null=True)
+    talla_id = serializers.SlugRelatedField(
+        slug_field="nombre", 
+        queryset=Talla.objects.all(), 
+        source="talla", 
+        required=False, 
+        allow_null=True
+    )
 
     class Meta:
         model = NotaEnsambleDetalle
@@ -497,7 +503,14 @@ class TrasladoProductoSerializer(serializers.ModelSerializer):
     bodega_destino_id = serializers.PrimaryKeyRelatedField(queryset=Bodega.objects.all(), source="bodega_destino", write_only=True)
 
     producto_id = serializers.PrimaryKeyRelatedField(queryset=Producto.objects.all(), source="producto", write_only=True)
-    talla_id = serializers.PrimaryKeyRelatedField(queryset=Talla.objects.all(), source="talla", required=False, allow_null=True, write_only=True)
+    talla_id = serializers.SlugRelatedField(
+        slug_field="nombre", 
+        queryset=Talla.objects.all(), 
+        source="talla", 
+        required=False, 
+        allow_null=True, 
+        write_only=True
+    )
 
     producto = ProductoSerializer(read_only=True)
     talla = TallaSerializer(read_only=True)
@@ -520,7 +533,7 @@ class NotaSalidaProductoDetalleInputSerializer(serializers.Serializer):
     producto_id = serializers.CharField()
     talla = serializers.CharField(required=False, allow_blank=True)
     cantidad = serializers.DecimalField(max_digits=12, decimal_places=3)
-    costo_unitario = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, allow_null=True)
+    costo_unitario = serializers.DecimalField(max_digits=14, decimal_places=2, required=True)
 
     def validate_cantidad(self, v):
         if v is None or v <= 0:
@@ -528,13 +541,25 @@ class NotaSalidaProductoDetalleInputSerializer(serializers.Serializer):
         return v
 
 
+class NotaSalidaAfectacionStockSerializer(serializers.ModelSerializer):
+    detalle_stock_id = serializers.IntegerField(source="detalle_stock.id", read_only=True)
+    nota_ensamble_id = serializers.IntegerField(source="detalle_stock.nota.id", read_only=True)
+
+    class Meta:
+        model = NotaSalidaAfectacionStock
+        fields = ["id", "detalle_stock_id", "nota_ensamble_id", "cantidad", "creado_en"]
+
+
 class NotaSalidaProductoDetalleSerializer(serializers.ModelSerializer):
     producto = serializers.SerializerMethodField()
+    talla = serializers.CharField(read_only=True)
     total = serializers.SerializerMethodField()
+
+    afectaciones = NotaSalidaAfectacionStockSerializer(many=True, read_only=True)
 
     class Meta:
         model = NotaSalidaProductoDetalle
-        fields = ["id", "producto", "talla", "cantidad", "costo_unitario", "total", "creado_en"]
+        fields = ["id", "producto", "talla", "cantidad", "costo_unitario", "total", "afectaciones", "creado_en"]
 
     def get_producto(self, obj):
         return {
@@ -545,15 +570,6 @@ class NotaSalidaProductoDetalleSerializer(serializers.ModelSerializer):
     def get_total(self, obj):
         t = obj.total
         return str(t) if t is not None else None
-
-
-class NotaSalidaAfectacionStockSerializer(serializers.ModelSerializer):
-    detalle_stock_id = serializers.IntegerField(source="detalle_stock.id", read_only=True)
-    nota_ensamble_id = serializers.IntegerField(source="detalle_stock.nota.id", read_only=True)
-
-    class Meta:
-        model = NotaSalidaAfectacionStock
-        fields = ["id", "detalle_stock_id", "nota_ensamble_id", "cantidad", "creado_en"]
 
 
 class NotaSalidaProductoSerializer(serializers.ModelSerializer):
@@ -591,20 +607,59 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         detalles_input = validated_data.pop("detalles_input", [])
         salida = NotaSalidaProducto.objects.create(**validated_data)
+        self._aplicar_detalles(salida, detalles_input)
+        return salida
 
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        detalles_input = validated_data.pop("detalles_input", None)
+
+        # 1. Reversar stock actual si vienen nuevos detalles
+        if detalles_input is not None:
+            for detalle in instance.detalles.all():
+                # Reversar FIFO
+                for afectacion in detalle.afectaciones.all():
+                    stock_row = afectacion.detalle_stock
+                    stock_row.cantidad = (stock_row.cantidad + afectacion.cantidad)
+                    stock_row.save(update_fields=["cantidad"])
+                
+                # Reversar global
+                datos = DatosAdicionalesProducto.objects.filter(producto=detalle.producto).first()
+                if datos:
+                    datos.stock = (datos.stock + detalle.cantidad)
+                    datos.save(update_fields=["stock"])
+            
+            # Limpiar detalles anteriores
+            instance.detalles.all().delete()
+
+        # 2. Actualizar metadata de la nota
+        instance = super().update(instance, validated_data)
+
+        # 3. Aplicar nuevos detalles
+        if detalles_input is not None:
+            self._aplicar_detalles(instance, detalles_input)
+
+        return instance
+
+    def _aplicar_detalles(self, salida, detalles_input):
         # FIFO: descuenta de NotaEnsambleDetalle en la bodega efectiva
         for d in detalles_input:
             producto = Producto.objects.get(codigo_sku=d["producto_id"])
             talla = (d.get("talla") or "").strip()
             cantidad_req = d["cantidad"]
 
-            # stock en esa bodega: (bodega_actual=bodega) OR (bodega_actual NULL y nota.bodega=bodega)
-            bodega = salida.bodega
+            # 1. Descontar del stock global
+            datos = DatosAdicionalesProducto.objects.filter(producto=producto).first()
+            if datos:
+                datos.stock = (datos.stock - cantidad_req)
+                datos.save(update_fields=["stock"])
 
+            # 2. Descontar de la bodega (FIFO)
+            bodega = salida.bodega
             qs_stock = (
                 NotaEnsambleDetalle.objects
                 .select_for_update()
-                .filter(producto=producto, talla=talla)
+                .filter(producto=producto, talla__nombre=talla)
                 .filter(
                     Q(bodega_actual=bodega) |
                     Q(bodega_actual__isnull=True, nota__bodega=bodega)
@@ -646,8 +701,6 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
                 )
 
                 restante -= tomar
-
-        return salida
 
 
 
