@@ -620,8 +620,8 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
                 # Reversar FIFO
                 for afectacion in detalle.afectaciones.all():
                     stock_row = afectacion.detalle_stock
-                    stock_row.cantidad = (stock_row.cantidad + afectacion.cantidad)
-                    stock_row.save(update_fields=["cantidad"])
+                    stock_row.cantidad_disponible = (stock_row.cantidad_disponible + afectacion.cantidad)
+                    stock_row.save(update_fields=["cantidad_disponible"])
                 
                 # Reversar global
                 datos = DatosAdicionalesProducto.objects.filter(producto=detalle.producto).first()
@@ -667,7 +667,7 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
                 .order_by("nota__fecha_elaboracion", "id")
             )
 
-            disponible = qs_stock.aggregate(s=Sum("cantidad"))["s"] or Decimal("0")
+            disponible = qs_stock.aggregate(s=Sum("cantidad_disponible"))["s"] or Decimal("0")
             if disponible < cantidad_req:
                 raise serializers.ValidationError(
                     f"Stock insuficiente para {producto.codigo_sku} talla '{talla or '-'}' en bodega {bodega.nombre}. "
@@ -687,12 +687,12 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
                 if restante <= 0:
                     break
 
-                tomar = min(restante, stock_row.cantidad)
+                tomar = min(restante, stock_row.cantidad_disponible)
                 if tomar <= 0:
                     continue
 
-                stock_row.cantidad = (stock_row.cantidad - tomar)
-                stock_row.save(update_fields=["cantidad"])
+                stock_row.cantidad_disponible = (stock_row.cantidad_disponible - tomar)
+                stock_row.save(update_fields=["cantidad_disponible"])
 
                 NotaSalidaAfectacionStock.objects.create(
                     salida_detalle=det_salida,

@@ -646,6 +646,24 @@ class ReporteBodegasStockAPIView(APIView):
             .order_by("bodega_actual__nombre", "producto__codigo_sku")
         )
 
+        # Chart: Distribución de productos por bodega
+        bodega_dist = (
+            prod_det.values("bodega_actual__nombre")
+            .annotate(unidades=Coalesce(Sum("cantidad"), D0_3(), output_field=DEC3))
+            .order_by("-unidades")
+        )
+
+        charts = [
+            {
+                "id": "stock_por_bodega",
+                "type": "pie",
+                "title": "Distribución de stock por bodega",
+                "unit": "unidades",
+                "labels": [x["bodega_actual__nombre"] or "Sin Bodega" for x in bodega_dist],
+                "series": [{"name": "Unidades", "data": [_dec_str(x["unidades"]) for x in bodega_dist]}],
+            }
+        ]
+
         return Response(
             {
                 "ok": True,
@@ -654,7 +672,7 @@ class ReporteBodegasStockAPIView(APIView):
                     "insumos_items": len(ins_rows),
                     "productos_items": len(prod_rows),
                 },
-                "charts": [],
+                "charts": charts,
                 "rows": {
                     "insumos": [
                         {
@@ -727,12 +745,40 @@ class ReporteNotasSalidasResumenAPIView(APIView):
             "costo_total": _dec_str(costo_total),
         }
 
+        # Chart: Ventas por Tercero (Top 10)
+        terceros_dist = (
+            sal.values("tercero__nombre")
+            .annotate(
+                valor=Coalesce(
+                    Sum(
+                        Cast(F("detalles__cantidad"), output_field=DEC3) *
+                        Cast(Coalesce(F("detalles__costo_unitario"), D0(), output_field=DEC), output_field=DEC),
+                        output_field=DEC,
+                    ),
+                    D0(),
+                    output_field=DEC,
+                )
+            )
+            .order_by("-valor")[:10]
+        )
+
+        charts = [
+            {
+                "id": "ventas_por_tercero",
+                "type": "bar",
+                "title": "Ventas por Tercero (Valor)",
+                "unit": "valor",
+                "labels": [x["tercero__nombre"] or "Sin Tercero" for x in terceros_dist],
+                "series": [{"name": "Valor", "data": [_dec_str(x["valor"]) for x in terceros_dist]}],
+            }
+        ]
+
         return Response(
             {
                 "ok": True,
                 "filters": _filters_payload(f),
                 "kpis": kpis,
-                "charts": [],
+                "charts": charts,
                 "rows": [],
             },
             status=status.HTTP_200_OK,

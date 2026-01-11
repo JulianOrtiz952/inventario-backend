@@ -334,6 +334,7 @@ class NotaEnsambleDetalle(models.Model):
     producto = models.ForeignKey("Producto", on_delete=models.PROTECT, related_name="ensambles_detalle")
     talla = models.ForeignKey("Talla", on_delete=models.PROTECT, null=True, blank=True, related_name="ensambles_detalle")
     cantidad = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+    cantidad_disponible = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
 
     bodega_actual = models.ForeignKey(
         "Bodega",
@@ -347,6 +348,10 @@ class NotaEnsambleDetalle(models.Model):
         unique_together = ("nota", "producto", "talla", "bodega_actual")
 
     def save(self, *args, **kwargs):
+        # si es nuevo, inicializar cantidad_disponible
+        if self.pk is None and self.cantidad_disponible == 0:
+            self.cantidad_disponible = self.cantidad
+        
         # si no viene bodega_actual, por defecto es la bodega de la nota
         if self.bodega_actual_id is None and self.nota_id is not None:
             self.bodega_actual = self.nota.bodega

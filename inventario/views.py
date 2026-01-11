@@ -483,7 +483,15 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
 
         # ✅ Crear detalles
         NotaEnsambleDetalle.objects.bulk_create(
-            [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
+            [
+                NotaEnsambleDetalle(
+                    nota=nota,
+                    cantidad_disponible=d["cantidad"],
+                    bodega_actual=nota.bodega,
+                    **d
+                )
+                for d in detalles_data
+            ]
         )
 
         nota.refresh_from_db()
@@ -565,11 +573,18 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
             # 3) Guardar cabecera
             nota = serializer.save()
 
-            # 4) Reemplazar detalles si vienen
             if detalles_data is not None:
                 nota.detalles.all().delete()
                 NotaEnsambleDetalle.objects.bulk_create(
-                    [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
+                    [
+                        NotaEnsambleDetalle(
+                            nota=nota,
+                            cantidad_disponible=d["cantidad"],
+                            bodega_actual=nota.bodega,
+                            **d
+                        )
+                        for d in detalles_data
+                    ]
                 )
 
             # 5) Reemplazar insumos manuales si vienen
@@ -722,7 +737,7 @@ class BodegaViewSet(viewsets.ModelViewSet):
 
         data = (
             qs.values("producto__codigo_sku", "producto__nombre", "talla__nombre")
-              .annotate(cantidad=Sum("cantidad"))
+              .annotate(cantidad=Sum("cantidad_disponible"))
               .order_by("producto__codigo_sku", "talla__nombre")
         )
 
@@ -773,7 +788,7 @@ class BodegaViewSet(viewsets.ModelViewSet):
             .annotate(bodega_efectiva=Coalesce("bodega_actual_id", "nota__bodega_id"))
             .filter(bodega_efectiva=bodega.id)
             .values("producto__codigo_sku", "producto__nombre")
-            .annotate(total_producido=Sum("cantidad"))
+            .annotate(total_producido=Sum("cantidad"), stock_actual=Sum("cantidad_disponible"))
             .order_by("producto__nombre")
         )
 
@@ -783,6 +798,7 @@ class BodegaViewSet(viewsets.ModelViewSet):
                 "codigo": p["producto__codigo_sku"],
                 "nombre": p["producto__nombre"],
                 "total_producido": str(p["total_producido"] or 0),
+                "stock_actual": str(p["stock_actual"] or 0),
             })
 
         return Response({
@@ -856,7 +872,7 @@ class ProductoViewSet(viewsets.ModelViewSet):
 
         items = (
             qs.values("talla__nombre")
-            .annotate(cantidad=Sum("cantidad"))
+            .annotate(cantidad=Sum("cantidad_disponible"))
             .order_by("talla__nombre")
         )
 
@@ -1178,7 +1194,7 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
             # Bloquear filas para evitar race conditions
             qs = qs.select_for_update()
 
-            disponible_total = sum(_d(x.cantidad) for x in qs)
+            disponible_total = sum(_d(x.cantidad_disponible) for x in qs)
             if disponible_total < cantidad:
                 talla_nombre = talla.nombre if talla else "Única"
                 raise ValidationError({
@@ -1195,14 +1211,14 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
                 if restante <= 0: 
                     break
                 
-                disponible_det = _d(det.cantidad)
+                disponible_det = _d(det.cantidad_disponible)
                 mover = min(disponible_det, restante)
                 if mover <= 0:
                     continue
                 
                 # 1. Restar origen
-                det.cantidad = disponible_det - mover
-                det.save(update_fields=["cantidad"])
+                det.cantidad_disponible = disponible_det - mover
+                det.save(update_fields=["cantidad_disponible"])
 
                 # 2. Sumar destino
                 dest_det, _created = NotaEnsambleDetalle.objects.get_or_create(
@@ -1210,10 +1226,10 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
                     producto=det.producto,
                     talla=det.talla,
                     bodega_actual=b_destino,
-                    defaults={"cantidad": Decimal("0")}
+                    defaults={"cantidad": Decimal("0"), "cantidad_disponible": Decimal("0")}
                 )
-                dest_det.cantidad = _d(dest_det.cantidad) + mover
-                dest_det.save(update_fields=["cantidad"])
+                dest_det.cantidad_disponible = _d(dest_det.cantidad_disponible) + mover
+                dest_det.save(update_fields=["cantidad_disponible"])
 
                 # 3. Historial
                 TrasladoProducto.objects.create(
@@ -1277,7 +1293,7 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
         else:
             qs = qs.filter(talla=talla)
 
-        disponible_total = sum(_d(x.cantidad) for x in qs)
+        disponible_total = sum(_d(x.cantidad_disponible) for x in qs)
         if disponible_total < cantidad:
             raise ValidationError({
                 "stock_insuficiente": {
@@ -1293,7 +1309,7 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
             if restante <= 0:
                 break
 
-            disponible_det = _d(det.cantidad)
+            disponible_det = _d(det.cantidad_disponible)
             mover = min(disponible_det, restante)
             if mover <= 0:
                 continue
@@ -1301,10 +1317,10 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
             # 1) restar en origen (PERSISTIR)
             nuevo_origen = disponible_det - mover
             if nuevo_origen < 0:
-                raise ValidationError("Error interno: cantidad negativa tras traslado.")
+                raise ValidationError("Error interno: cantidad disponible negativa tras traslado.")
 
-            det.cantidad = nuevo_origen
-            det.save(update_fields=["cantidad"])  # ✅ CLAVE: guardar la resta
+            det.cantidad_disponible = nuevo_origen
+            det.save(update_fields=["cantidad_disponible"])  # ✅ CLAVE: guardar la resta
 
             # 2) sumar/crear en destino manteniendo MISMA nota
             dest_det, _created = NotaEnsambleDetalle.objects.get_or_create(
@@ -1312,10 +1328,10 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
                 producto=det.producto,
                 talla=det.talla,
                 bodega_actual=b_destino,
-                defaults={"cantidad": Decimal("0")}
+                defaults={"cantidad": Decimal("0"), "cantidad_disponible": Decimal("0")}
             )
-            dest_det.cantidad = _d(dest_det.cantidad) + mover
-            dest_det.save(update_fields=["cantidad"])
+            dest_det.cantidad_disponible = _d(dest_det.cantidad_disponible) + mover
+            dest_det.save(update_fields=["cantidad_disponible"])
 
             # 3) historial
             TrasladoProducto.objects.create(
@@ -1349,8 +1365,8 @@ class NotaSalidaProductoViewSet(viewsets.ModelViewSet):
             # 1. Devolver a la bodega (FIFO afectaciones)
             for afectacion in detalle.afectaciones.all():
                 stock_row = afectacion.detalle_stock
-                stock_row.cantidad = (stock_row.cantidad + afectacion.cantidad)
-                stock_row.save(update_fields=["cantidad"])
+                stock_row.cantidad_disponible = (stock_row.cantidad_disponible + afectacion.cantidad)
+                stock_row.save(update_fields=["cantidad_disponible"])
             
             # 2. Devolver al global
             datos = DatosAdicionalesProducto.objects.filter(producto=detalle.producto).first()
@@ -1773,7 +1789,8 @@ class ExcelImportViewSet(viewsets.ViewSet):
                     )
                     if not created:
                         det.cantidad = (Decimal(str(det.cantidad or 0)) + Decimal(str(cantidad))).quantize(Decimal("0.001"))
-                        det.save(update_fields=["cantidad"])
+                        det.cantidad_disponible = (Decimal(str(det.cantidad_disponible or 0)) + Decimal(str(cantidad))).quantize(Decimal("0.001"))
+                        det.save(update_fields=["cantidad", "cantidad_disponible"])
 
                     # stock global
                     datos = DatosAdicionalesProducto.objects.filter(producto=producto).first()
