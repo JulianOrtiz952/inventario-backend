@@ -31,8 +31,9 @@ from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
     TerceroSerializer, DatosAdicionalesWriteSerializer,
-    TallaSerializer, NotaEnsambleSerializer, ProductoInsumoSerializer,
-    TrasladoProductoSerializer, NotaSalidaProductoSerializer, InsumoMovimientoSerializer, InsumoMovimientoInputSerializer,
+    TallaSerializer, NotaEnsambleSerializer, NotaEnsambleListSerializer, ProductoInsumoSerializer,
+    TrasladoProductoSerializer, NotaSalidaProductoSerializer, NotaSalidaProductoListSerializer,
+    InsumoMovimientoSerializer, InsumoMovimientoInputSerializer,
     ProductoTerminadoMovimientoSerializer
 )
 
@@ -262,12 +263,7 @@ class DebugValidationMixin:
 from .services.inventory_service import InventoryService
 
 class NotaEnsambleViewSet(viewsets.ModelViewSet):
-    queryset = (
-        NotaEnsamble.objects
-        .prefetch_related("detalles", "insumos")  # ✅ importante
-        .select_related("bodega", "tercero")
-        .order_by("-id")
-    )
+    queryset = NotaEnsamble.objects.all() # Fallback
     serializer_class = NotaEnsambleSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = NotaEnsambleFilter
@@ -278,6 +274,43 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         "detalles__producto__codigo_sku"
     ]
     ordering_fields = ["id", "fecha_elaboracion", "creado_en"]
+
+    def get_queryset(self):
+        # ✅ SQL Annotations: costo_total e items_count
+        # Esto evita N+1 en la lista y cálculos costosos en Python
+        qs = NotaEnsamble.objects.annotate(
+            costo_total=Coalesce(Sum("insumomovimientos__total"), Value(0, output_field=DecimalField())),
+            total_cantidad=Coalesce(Sum("detalles__cantidad"), Value(0, output_field=DecimalField())),
+            items_count=Count("detalles", distinct=True)
+        ).select_related("bodega", "tercero").order_by("-id")
+
+
+        if self.action == "list":
+            # Para el resumen de productos en la lista
+            qs = qs.prefetch_related("detalles__producto")
+
+        if self.action == "retrieve":
+            # Para el detalle completo
+            qs = qs.prefetch_related(
+                "detalles",
+                "detalles__producto",
+                "detalles__talla",
+                "insumos",
+                "insumos__insumo",
+                "insumomovimientos",
+                "insumomovimientos__insumo",
+                "insumomovimientos__tercero",
+                "insumomovimientos__bodega"
+            )
+
+        return qs
+
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return NotaEnsambleListSerializer
+        return NotaEnsambleSerializer
+
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -1067,12 +1100,37 @@ class TrasladoProductoViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({"ok": True, "cantidad_movida": str(cantidad)}, status=status.HTTP_200_OK)
 
 class NotaSalidaProductoViewSet(viewsets.ModelViewSet):
-    queryset = NotaSalidaProducto.objects.all().prefetch_related("detalles", "detalles__afectaciones", "bodega", "tercero")
+    queryset = NotaSalidaProducto.objects.all()
     serializer_class = NotaSalidaProductoSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = NotaSalidaProductoFilter
     search_fields = ["numero", "observacion", "detalles__producto__nombre", "detalles__producto__codigo_sku"]
     ordering_fields = ["id", "fecha", "creado_en"]
+
+    def get_queryset(self):
+        qs = NotaSalidaProducto.objects.annotate(
+            total_cantidad=Coalesce(Sum("detalles__cantidad"), Value(0, output_field=DecimalField())),
+            total_valor=Coalesce(Sum(F("detalles__cantidad") * F("detalles__costo_unitario")), Value(0, output_field=DecimalField())),
+            items_count=Count("detalles", distinct=True)
+        ).select_related("bodega", "tercero").order_by("-id")
+
+        if self.action == "list":
+            qs = qs.prefetch_related("detalles__producto")
+
+        if self.action == "retrieve":
+            qs = qs.prefetch_related(
+                "detalles",
+                "detalles__producto",
+                "detalles__afectaciones",
+                "detalles__afectaciones__detalle_stock"
+            )
+        return qs
+
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return NotaSalidaProductoListSerializer
+        return NotaSalidaProductoSerializer
 
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
@@ -1224,7 +1282,7 @@ class ExcelImportViewSet(viewsets.ViewSet):
 
         # --- Hoja Principal ---
         headers = [
-            "Codigo Producto", "Descripción", "Cantidad Entrada (Stock)",
+            "Codigo Producto", "Referencia", "Descripción", "Cantidad Entrada (Stock)",
             "Costo Unitario", "Marca (Proveedor)", "Color", "Factura", 
             "Bodega", "Tercero", "Unidad Medida"
         ]
@@ -1250,15 +1308,16 @@ class ExcelImportViewSet(viewsets.ViewSet):
             
         # Ejemplo de datos
         ws.cell(row=start_row + 1, column=start_col, value="INS-001").alignment = Alignment(horizontal="left")
-        ws.cell(row=start_row + 1, column=start_col + 1, value="Ej: Botón Rojo 5mm")
-        ws.cell(row=start_row + 1, column=start_col + 2, value=100)
-        ws.cell(row=start_row + 1, column=start_col + 3, value=50.00)
-        ws.cell(row=start_row + 1, column=start_col + 4, value="Proveedor ACME")
-        ws.cell(row=start_row + 1, column=start_col + 5, value="Rojo")
-        ws.cell(row=start_row + 1, column=start_col + 6, value="FAC-1234")
-        ws.cell(row=start_row + 1, column=start_col + 7, value="Bodega Principal")
-        ws.cell(row=start_row + 1, column=start_col + 8, value="Proveedor Genérico (ID: 1)")
-        ws.cell(row=start_row + 1, column=start_col + 9, value="UN")
+        ws.cell(row=start_row + 1, column=start_col + 1, value="REF-001")
+        ws.cell(row=start_row + 1, column=start_col + 2, value="Ej: Botón Rojo 5mm")
+        ws.cell(row=start_row + 1, column=start_col + 3, value=100)
+        ws.cell(row=start_row + 1, column=start_col + 4, value=50.00)
+        ws.cell(row=start_row + 1, column=start_col + 5, value="Proveedor ACME")
+        ws.cell(row=start_row + 1, column=start_col + 6, value="Rojo")
+        ws.cell(row=start_row + 1, column=start_col + 7, value="FAC-1234")
+        ws.cell(row=start_row + 1, column=start_col + 8, value="Bodega Principal")
+        ws.cell(row=start_row + 1, column=start_col + 9, value="Proveedor Genérico (ID: 1)")
+        ws.cell(row=start_row + 1, column=start_col + 10, value="UN")
 
         # --- Hoja Referencias (Ayuda) ---
         ws_ref = wb.create_sheet("Referencias")
@@ -1365,7 +1424,8 @@ class ExcelImportViewSet(viewsets.ViewSet):
 
         # Mapa de alias (Cliente -> Backend)
         aliases = {
-            "codigo producto": "codigo", "codigo": "codigo", "referencia": "codigo",
+            "codigo producto": "codigo", "codigo": "codigo",
+            "referencia": "referencia", "ref": "referencia",
             "descripción": "nombre", "descripcion": "nombre", "producto": "nombre", "nombre": "nombre",
             "cantidad entrada (stock)": "cantidad_entrada", "stock actual": "cantidad_entrada", "stock": "cantidad_entrada", 
             "cantidad": "cantidad_entrada", "entradas": "cantidad_entrada", "cantidad_entrada": "cantidad_entrada",
@@ -1496,13 +1556,18 @@ class ExcelImportViewSet(viewsets.ViewSet):
                         proveedor_obj = cache_proveedores[p_upper]
                     else:
                         # Crear proveedor on the fly si no existe
-                        proveedor_obj = Proveedor.objects.create(nombre=prov_nombre)
+                        # Usamos p_upper para asegurar consistencia con el cache y la DB
+                        proveedor_obj = Proveedor.objects.create(nombre=p_upper)
                         cache_proveedores[p_upper] = proveedor_obj
 
                 observacion = str(get_val("observacion", "")).strip()
                 color = str(get_val("color", "")).strip()
                 factura = str(get_val("factura", "")).strip()
                 unidad_medida = str(get_val("unidad_medida", "")).strip().upper() # Capturar unidad
+
+                referencia_val = str(get_val("referencia", "")).strip()
+                if not referencia_val:
+                    referencia_val = codigo
 
                 # --- Lógica de Creación / Actualización ---
                 insumo = Insumo.objects.filter(codigo=codigo).first()
@@ -1518,7 +1583,7 @@ class ExcelImportViewSet(viewsets.ViewSet):
                         color=color,
                         factura=factura,
                         observacion=observacion,
-                        referencia=codigo,
+                        referencia=referencia_val,
                         unidad_medida=unidad_medida # Guardar unidad
                     )
                     registrar_movimiento_sin_afectar_stock(
@@ -1639,8 +1704,8 @@ class ExcelImportViewSet(viewsets.ViewSet):
         notas_cache = {}  # key=(fecha,bodega_id,tercero_id,obs) -> nota_id
 
         for i, r in enumerate(rows[1:], start=2):
+
             try:
-                # ✅ transacción por fila (si falla, no rompe el resto)
                 with transaction.atomic():
 
                     fecha = _parse_date(r[idx["fecha"]], "fecha") or timezone.now().date()
@@ -1761,3 +1826,184 @@ class ExcelImportViewSet(viewsets.ViewSet):
         qs = qs.order_by("-fecha", "-id")[:200]  # límite seguro
 
         return Response(ProductoTerminadoMovimientoSerializer(qs, many=True).data)
+
+    # =========================================================================
+    #  CATÁLOGOS: PROVEEDORES
+    # =========================================================================
+    @action(detail=False, methods=["get"], url_path="plantilla-proveedores", renderer_classes=[XLSXRenderer])
+    def plantilla_proveedores(self, request):
+        return self._generar_plantilla_catalogo("Proveedores", ["Nombre"], "PROVEEDOR EJEMPLO SAS", "plantilla_proveedores.xlsx")
+
+    @action(detail=False, methods=["post"], url_path="importar-proveedores")
+    @transaction.atomic
+    def importar_proveedores(self, request):
+        return self._import_catalogo_generic(
+            request, model=Proveedor, key_field="nombre", expected_keys=["nombre"], 
+            aliases={"proveedor": "nombre", "nombre proveedor": "nombre"}, normalize_upper=True
+        )
+
+    # =========================================================================
+    #  CATÁLOGOS: TERCEROS
+    # =========================================================================
+    @action(detail=False, methods=["get"], url_path="plantilla-terceros", renderer_classes=[XLSXRenderer])
+    def plantilla_terceros(self, request):
+        return self._generar_plantilla_catalogo("Terceros", ["Codigo", "Nombre"], ["T-001", "CLIENTE JUAN PEREZ"], "plantilla_terceros.xlsx")
+
+    @action(detail=False, methods=["post"], url_path="importar-terceros")
+    @transaction.atomic
+    def importar_terceros(self, request):
+        return self._import_catalogo_generic(
+            request, model=Tercero, key_field="codigo", expected_keys=["codigo", "nombre"],
+            aliases={"id": "codigo", "documento": "codigo", "nit": "codigo"}, normalize_upper=True, update_fields=["nombre"]
+        )
+
+    # =========================================================================
+    #  CATÁLOGOS: BODEGAS
+    # =========================================================================
+    @action(detail=False, methods=["get"], url_path="plantilla-bodegas", renderer_classes=[XLSXRenderer])
+    def plantilla_bodegas(self, request):
+        return self._generar_plantilla_catalogo("Bodegas", ["Codigo", "Nombre"], ["B-01", "BODEGA PRINCIPAL"], "plantilla_bodegas.xlsx")
+
+    @action(detail=False, methods=["post"], url_path="importar-bodegas")
+    @transaction.atomic
+    def importar_bodegas(self, request):
+        return self._import_catalogo_generic(
+            request, model=Bodega, key_field="codigo", expected_keys=["codigo", "nombre"],
+            aliases={"id": "codigo"}, normalize_upper=True, update_fields=["nombre"]
+        )
+
+    # =========================================================================
+    #  CATÁLOGOS: TALLAS
+    # =========================================================================
+    @action(detail=False, methods=["get"], url_path="plantilla-tallas", renderer_classes=[XLSXRenderer])
+    def plantilla_tallas(self, request):
+        return self._generar_plantilla_catalogo("Tallas", ["Nombre"], "XL", "plantilla_tallas.xlsx")
+
+    @action(detail=False, methods=["post"], url_path="importar-tallas")
+    @transaction.atomic
+    def importar_tallas(self, request):
+        return self._import_catalogo_generic(
+            request, model=Talla, key_field="nombre", expected_keys=["nombre"],
+            aliases={"talla": "nombre", "valor": "nombre"}, normalize_upper=True
+        )
+
+    # =========================================================================
+    #  HELPERS GENÉRICOS
+    # =========================================================================
+    def _generar_plantilla_catalogo(self, title, headers, example_row, filename):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = title
+        
+        # Estilos
+        bold_white = Font(bold=True, color="FFFFFF")
+        dark_blue_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+        start_row = 2
+        start_col = 2
+        
+        for idx, h in enumerate(headers):
+            cell = ws.cell(row=start_row, column=start_col + idx, value=h)
+            cell.font = bold_white
+            cell.fill = dark_blue_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+            ws.column_dimensions[chr(65 + start_col + idx - 1)].width = 30
+        
+        # Ejemplo
+        if not isinstance(example_row, list):
+            example_row = [example_row]
+            
+        for idx, val in enumerate(example_row):
+            ws.cell(row=start_row+1, column=start_col + idx, value=val)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return Response(buf.getvalue(), headers={'Content-Disposition': f'attachment; filename="{filename}"'}, content_type=XLSXRenderer.media_type)
+
+    def _import_catalogo_generic(self, request, model, key_field, expected_keys, aliases={}, normalize_upper=True, update_fields=[]):
+        file = request.FILES.get("file")
+        if not file: raise ValidationError({"file": "No se envió archivo."})
+
+        try:
+            wb = load_workbook(filename=file, data_only=True)
+        except Exception as e:
+            raise ValidationError({"file": f"Error leyendo Excel: {e}"})
+        
+        ws = wb.active 
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows: raise ValidationError("Excel vacío.")
+        
+        # Header smart detection
+        header_row_idx = -1
+        idx = {}
+        keywords = [k.lower() for k in expected_keys]
+
+        for i, row in enumerate(rows[:10]):
+            row_str = [str(c).lower().strip() for c in row if c]
+            matches = sum(1 for c in row_str if any(k in c for k in keywords))
+            if matches >= 1: 
+                header_row_idx = i
+                for col_idx, raw_h in enumerate(row):
+                    h = str(raw_h).lower().strip()
+                    if h in aliases: h = aliases[h]
+                    if h in expected_keys:
+                        idx[h] = col_idx
+                break
+        
+        if header_row_idx == -1 or not idx:
+            raise ValidationError(f"No se detectaron las columnas requeridas: {expected_keys}")
+
+        ok = 0
+        errores = []
+        created_count = 0
+        updated_count = 0
+
+        for i, r in enumerate(rows[header_row_idx+1:], start=header_row_idx+2):
+            try:
+                def get_val(k):
+                    if k in idx and idx[k] < len(r):
+                        v = r[idx[k]]
+                        return str(v).strip() if v is not None else ""
+                    return ""
+
+                pk_val = get_val(key_field)
+                if not pk_val: continue
+                
+                if normalize_upper: pk_val = pk_val.upper()
+
+                filter_kwargs = {key_field: pk_val}
+                obj = model.objects.filter(**filter_kwargs).first()
+                
+                defaults = {}
+                for f in update_fields:
+                    val = get_val(f)
+                    if normalize_upper: val = val.upper()
+                    if val: defaults[f] = val
+
+                if not obj:
+                    create_data = {key_field: pk_val, **defaults}
+                    model.objects.create(**create_data)
+                    created_count += 1
+                else:
+                    changed = False
+                    for k, v in defaults.items():
+                        if getattr(obj, k) != v:
+                            setattr(obj, k, v)
+                            changed = True
+                    if changed:
+                        obj.save()
+                        updated_count += 1
+                
+                ok += 1
+            except Exception as e:
+                errores.append({"fila": i, "error": str(e)})
+
+        return Response({
+            "ok": True,
+            "procesadas_ok": ok,
+            "creados": created_count,
+            "actualizados": updated_count,
+            "errores": errores
+        })

@@ -387,7 +387,8 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
     # --- LECTURA (rico) ---
     detalles = NotaEnsambleDetalleSerializer(many=True, read_only=True)
     insumos = NotaEnsambleInsumoSerializer(many=True, read_only=True)
-    movimientos = InsumoMovimientoSerializer(many=True, read_only=True, source="insumomovimiento_set")
+    movimientos = InsumoMovimientoSerializer(many=True, read_only=True, source="insumomovimientos")
+
 
     bodega = BodegaSerializer(read_only=True)
     tercero = TerceroSerializer(read_only=True)
@@ -435,9 +436,58 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
         ]
 
     def get_costo_total(self, obj):
-        movs = obj.insumomovimiento_set.all()
+        movs = obj.insumomovimientos.all()
         total = sum(m.total for m in movs) if movs.exists() else 0
         return str(total)
+
+class NotaEnsambleListSerializer(serializers.ModelSerializer):
+
+    """Versión ligera para el Historial/Lista"""
+    bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
+    tercero_nombre = serializers.CharField(source="tercero.nombre", read_only=True)
+    costo_total = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True) 
+    total_cantidad = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    productos_resumen = serializers.SerializerMethodField(read_only=True)
+
+
+    class Meta:
+        model = NotaEnsamble
+        fields = [
+            "id",
+            "fecha_elaboracion",
+            "bodega_nombre",
+            "tercero_nombre",
+            "costo_total",
+            "total_cantidad",
+            "productos_resumen",
+            "observaciones",
+            "creado_en",
+        ]
+
+    def get_productos_resumen(self, obj):
+        detalles = list(obj.detalles.all())
+        if not detalles: return "—"
+        
+        # Agrupar por producto (usualmente hay pocos en la nota)
+        nombres = []
+        seen = set()
+        for d in detalles:
+            if d.producto and d.producto.nombre not in seen:
+                nombres.append(d.producto.nombre)
+                seen.add(d.producto.nombre)
+        
+        if not nombres: return "—"
+        if len(nombres) == 1: return nombres[0]
+        return f"{nombres[0]} (+{len(nombres)-1})"
+
+
+
+
+    def get_costo_total(self, obj):
+        movs = obj.insumomovimientos.all()
+        total = sum(m.total for m in movs) if movs.exists() else 0
+        return str(total)
+
 
     def validate(self, attrs):
         insumos_data = attrs.get("insumos_input") or []
@@ -662,9 +712,47 @@ class NotaSalidaProductoSerializer(serializers.ModelSerializer):
 
                 restante -= tomar
 
+class NotaSalidaProductoListSerializer(serializers.ModelSerializer):
 
+
+    """Versión ligera para la Lista de Salidas"""
+    bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
+    tercero_nombre = serializers.CharField(source="tercero.nombre", read_only=True)
+    total_cantidad = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    total_valor = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    productos_resumen = serializers.SerializerMethodField(read_only=True)
+
+
+    class Meta:
+        model = NotaSalidaProducto
+        fields = [
+            "id",
+            "numero",
+            "fecha",
+            "bodega_nombre",
+            "tercero_nombre",
+            "total_cantidad",
+            "total_valor",
+            "productos_resumen",
+            "observacion",
+            "creado_en",
+        ]
+
+    def get_productos_resumen(self, obj):
+        detalles = list(obj.detalles.all())
+        if not detalles: return "—"
+        nombres = []
+        seen = set()
+        for d in detalles:
+            if d.producto and d.producto.nombre not in seen:
+                nombres.append(d.producto.nombre)
+                seen.add(d.producto.nombre)
+        if not nombres: return "—"
+        if len(nombres) == 1: return nombres[0]
+        return f"{nombres[0]} (+{len(nombres)-1})"
 
 class InsumoMovimientoInputSerializer(serializers.Serializer):
+
     tipo = serializers.ChoiceField(choices=[
         "ENTRADA", "SALIDA", "AJUSTE"
     ])

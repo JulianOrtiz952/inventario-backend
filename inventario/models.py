@@ -8,6 +8,16 @@ class Proveedor(models.Model):
     nombre = models.CharField(max_length=100, db_index=True)
     es_activo = models.BooleanField(default=True)
 
+    def clean(self):
+        if self.nombre:
+            self.nombre = self.nombre.upper()
+        super().clean()
+
+    def save(self, *args, **kwargs):
+        if self.nombre:
+            self.nombre = self.nombre.upper()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return self.nombre
 
@@ -505,7 +515,14 @@ class InsumoMovimiento(models.Model):
     observacion = models.TextField(blank=True, default="")
 
     # Referencia opcional a una nota de ensamble (para trazabilidad)
-    nota_ensamble = models.ForeignKey("NotaEnsamble", on_delete=models.SET_NULL, null=True, blank=True)
+    nota_ensamble = models.ForeignKey(
+        "NotaEnsamble", 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name="insumomovimientos"
+    )
+
 
     class Meta:
         ordering = ["-fecha", "-id"]
@@ -538,7 +555,14 @@ class ProductoTerminadoMovimiento(models.Model):
     saldo_global_resultante = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
 
     # documento asociado (reusamos NotaEnsamble como “documento de ingreso”)
-    nota_ensamble = models.ForeignKey("NotaEnsamble", on_delete=models.SET_NULL, null=True, blank=True)
+    nota_ensamble = models.ForeignKey(
+        "NotaEnsamble", 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name="productos_terminados_movimientos"
+    )
+
 
     observacion = models.TextField(blank=True, default="")
 
