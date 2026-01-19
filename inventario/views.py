@@ -2,7 +2,7 @@ from rest_framework import viewsets, status, filters
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.db import transaction
 from rest_framework.decorators import action
 from django.db.models import Sum, Count, Q, F, Case, When, DecimalField, Value, IntegerField
@@ -12,6 +12,7 @@ from django.shortcuts import get_object_or_404
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 from .renderers import XLSXRenderer
 import io
 from datetime import datetime
@@ -118,7 +119,9 @@ def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario
     total = (cantidad * costo_unitario).quantize(Decimal("0.01"))
 
     with transaction.atomic():
-        insumo.refresh_from_db()
+        # 🔒 Bloquear el insumo para evitar modificaciones concurrentes
+        # en lugar de insumo.refresh_from_db()
+        insumo = Insumo.objects.select_for_update().get(pk=insumo.pk)
 
         if tipo in ("SALIDA", "CONSUMO_ENSAMBLE"):
             if insumo.cantidad < cantidad:
@@ -126,6 +129,20 @@ def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario
             
             # Validar stock de BODEGA específica (si se especifica bodega)
             if bodega:
+                # 🔒 También necesitamos asegurar que el cálculo del stock de bodega sea consistente
+                # Como InsumoMovimiento es append-only, no modificamos filas, pero leemos agregados.
+                # Si alguien inserta un movimiento justo ahora, el agregado cambiará.
+                # Idealmente deberíamos bloquear tablas o usar lógica de snapshots, pero
+                # para este nivel, validar contra el insumo (que ya tiene lock) suele ser "suficiente"
+                # si asumimos que la cantidad global es la fuente de verdad final, 
+                # o si aceptamos cierto riesgo en la distribución por bodega.
+                # 
+                # SIN EMBARGO, para ser estrictos, deberíamos bloquear las filas de movimientos
+                # o simplemente confiar en que el Insumo Lock serializa las escrituras sobre este insumo.
+                # Al tener locked 'insumo', nadie más puede entrar a este bloque para este insumo,
+                # así que nadie más insertará movimientos para ESTE insumo concurrentemente.
+                # ¡Es seguro!
+                
                 qs = InsumoMovimiento.objects.filter(insumo=insumo, bodega=bodega)
                 agg = qs.aggregate(
                     total_entradas=Sum(
@@ -177,9 +194,14 @@ def aplicar_movimiento_insumo(*, insumo, tercero, tipo, cantidad, costo_unitario
 
 def _parse_decimal(v, field):
     try:
-        if v is None or str(v).strip() == "":
+        if v is None: 
             return None
-        return Decimal(str(v).replace(",", ".")).quantize(Decimal("0.001"))
+        s = str(v).strip()
+        if not s: 
+            return None
+        # Normalizar coma a punto
+        s = s.replace(",", ".")
+        return Decimal(s).quantize(Decimal("0.001"))
     except Exception:
         raise ValidationError({field: f"Valor inválido: {v}"})
 
@@ -237,127 +259,7 @@ class DebugValidationMixin:
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-def _d(x):
-    try:
-        return Decimal(str(x))
-    except Exception:
-        return Decimal("0")
-
-def descontar_insumo_global(codigo, cantidad_total, bodega_preferida, tercero=None, nota_ensamble=None, tipo_movimiento=None, observacion_p=None):
-    """
-    Descuenta stock de un insumo (por código) buscando en múltiples bodegas.
-    Prioriza la bodega_preferida.
-    """
-    if tipo_movimiento is None:
-        tipo_movimiento = InsumoMovimiento.Tipo.CONSUMO_ENSAMBLE
-
-    cantidad_total = _d(cantidad_total)
-    if cantidad_total <= 0:
-        return
-
-    # 1. Verificar stock total global
-    total_global = Insumo.objects.filter(codigo=codigo, es_activo=True).aggregate(total=Sum('cantidad'))['total'] or Decimal('0')
-    if total_global < cantidad_total:
-        ins_ej = Insumo.objects.filter(codigo=codigo).first()
-        nombre = ins_ej.nombre if ins_ej else codigo
-        raise ValidationError({
-            "stock_insuficiente": {
-                codigo: {
-                    "insumo": nombre,
-                    "disponible": str(total_global),
-                    "requerido": str(cantidad_total),
-                    "faltante": str(cantidad_total - total_global),
-                }
-            }
-        })
-
-    # 2. Descontar priorizando bodega_preferida
-    insumos_qs = Insumo.objects.filter(codigo=codigo, es_activo=True).order_by(
-        Case(When(bodega=bodega_preferida, then=Value(0)), default=Value(1)),
-        '-cantidad'
-    )
-
-    restante = cantidad_total
-    for ins in insumos_qs:
-        if restante <= 0:
-            break
-        cant_en_bodega = _d(ins.cantidad)
-        if cant_en_bodega <= 0:
-            continue
-            
-        a_descontar = min(cant_en_bodega, restante)
-        nueva_cant = _round3(cant_en_bodega - a_descontar)
-        ins.cantidad = nueva_cant
-        ins.save(update_fields=['cantidad'])
-
-        # ✅ Registrar movimiento en Kardex para esta bodega
-        obs_mov = observacion_p or f"Consumo automático [{ins.bodega.nombre}] por nota #{getattr(nota_ensamble, 'id', 'S/N')}"
-        registrar_movimiento_sin_afectar_stock(
-            insumo=ins,
-            tercero=tercero or getattr(nota_ensamble, "tercero", None),
-            bodega=ins.bodega,
-            tipo=tipo_movimiento,
-            cantidad=a_descontar,
-            costo_unitario=ins.costo_unitario,
-            nota_ensamble=nota_ensamble,
-            observacion=obs_mov
-        )
-
-        restante -= a_descontar
-
-def _round3(d):
-    return _d(d).quantize(Decimal('0.001'))
-
-def consumir_insumos_por_delta(producto, bodega, cantidad_producto, nota_ensamble=None, observacion_p=None):
-    cantidad_producto = _d(cantidad_producto)
-    if cantidad_producto == 0:
-        return
-
-    lineas_bom = ProductoInsumo.objects.filter(producto=producto).select_related("insumo")
-    if not lineas_bom.exists():
-        return
-
-    for li in lineas_bom:
-        cpu = _d(li.cantidad_por_unidad)
-        merma = _d(li.merma_porcentaje)
-        requerido = cantidad_producto * cpu * (Decimal("1") + (merma / Decimal("100")))
-
-        if cantidad_producto > 0:
-            # Consumir (multi-bodega)
-            descontar_insumo_global(
-                li.insumo.codigo, 
-                requerido, 
-                bodega, 
-                nota_ensamble=nota_ensamble,
-                tipo_movimiento=InsumoMovimiento.Tipo.CONSUMO_ENSAMBLE,
-                observacion_p=observacion_p
-            )
-        else:
-            # Reversar (devolver a la bodega de la nota)
-            can_abs = abs(requerido)
-            ins_pref = Insumo.objects.filter(codigo=li.insumo.codigo, bodega=bodega).first()
-            if not ins_pref:
-                ins_pref = li.insumo
-            
-            ins_pref.cantidad = _round3(_d(ins_pref.cantidad) + can_abs)
-            ins_pref.save(update_fields=['cantidad'])
-
-            # ✅ Registrar movimiento de reversión
-            obs_mov = observacion_p or f"Reversión de consumo (BOM) por nota #{getattr(nota_ensamble, 'id', 'S/N')}"
-            registrar_movimiento_sin_afectar_stock(
-                insumo=ins_pref,
-                tercero=getattr(nota_ensamble, "tercero", None),
-                bodega=ins_pref.bodega,
-                tipo=InsumoMovimiento.Tipo.AJUSTE,
-                cantidad=can_abs,
-                costo_unitario=ins_pref.costo_unitario,
-                nota_ensamble=nota_ensamble,
-                observacion=obs_mov
-            )
-
-
-
-
+from .services.inventory_service import InventoryService
 
 class NotaEnsambleViewSet(viewsets.ModelViewSet):
     queryset = (
@@ -377,246 +279,61 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["id", "fecha_elaboracion", "creado_en"]
 
-    def _get_datos_adicionales(self, producto):
-        datos = DatosAdicionalesProducto.objects.filter(producto=producto).first()
-        if datos:
-            return datos
-
-        # ✅ defaults completos (según tu modelo)
-        return DatosAdicionalesProducto.objects.create(
-            producto=producto,
-            referencia="N/A",
-            unidad="UND",
-            stock=Decimal("0"),
-            stock_minimo=Decimal("0"),
-            descripcion=getattr(producto, "descripcion", "") or "",
-            marca="N/A",
-            modelo="N/A",
-            codigo_arn="N/A",
-            imagen_url="",
-        )
-
-    def _total_productos_nota(self, nota):
-        # ✅ sumatoria de cantidades de productos terminados
-        return sum(_d(d.cantidad) for d in nota.detalles.all())
-
-    def _aplicar_detalles(self, nota, detalles, signo=Decimal("1"), observacion_p=None):
-        """
-        Aplica o revierte:
-        - Consumo por receta (BOM)
-        - Stock del producto terminado
-        """
-        for det in detalles:
-            producto = det.producto
-            cantidad = _d(det.cantidad) * signo
-
-            # BOM
-            consumir_insumos_por_delta(producto, nota.bodega, cantidad, nota_ensamble=nota, observacion_p=observacion_p)
-
-            # Stock producto terminado
-            datos = self._get_datos_adicionales(producto)
-            datos.stock = _d(datos.stock) + cantidad
-            datos.save(update_fields=["stock"])
-
-    def _aplicar_insumos_manuales(self, nota, signo=Decimal("1"), observacion_p=None):
-        """
-        Interpreta ni.cantidad como: cantidad POR UNIDAD de producto terminado.
-        Entonces descuenta/devuelve: (ni.cantidad * total_productos_en_nota) * signo
-        """
-        total_productos = self._total_productos_nota(nota)
-        if total_productos == 0:
-            return
-
-        for ni in nota.insumos.all():
-            cant_total = _d(ni.cantidad) * _d(total_productos) * signo
-
-            if cant_total > 0:
-                # Consumir (multi-bodega)
-                descontar_insumo_global(
-                    ni.insumo.codigo, 
-                    cant_total, 
-                    nota.bodega, 
-                    tercero=nota.tercero, 
-                    nota_ensamble=nota,
-                    observacion_p=observacion_p
-                )
-            else:
-                # Reversar (devolver a la bodega de la nota)
-                can_abs = abs(cant_total)
-                ins_pref = Insumo.objects.filter(codigo=ni.insumo.codigo, bodega=nota.bodega).first()
-                if not ins_pref:
-                    ins_pref = ni.insumo
-                
-                ins_pref.cantidad = _round3(_d(ins_pref.cantidad) + can_abs)
-                ins_pref.save(update_fields=['cantidad'])
-
-                # ✅ Registrar movimiento de reversión
-                obs_mov = observacion_p or f"Reversión de consumo manual por nota #{nota.id}"
-                registrar_movimiento_sin_afectar_stock(
-                    insumo=ins_pref,
-                    tercero=nota.tercero,
-                    bodega=ins_pref.bodega,
-                    tipo=InsumoMovimiento.Tipo.AJUSTE,
-                    cantidad=can_abs,
-                    costo_unitario=ins_pref.costo_unitario,
-                    nota_ensamble=nota,
-                    observacion=obs_mov
-                )
-
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         """
-        Flujo:
-        1) Crear nota (serializer.create)
-        2) Crear detalles
-        3) Aplicar: BOM/stock + insumos manuales
+        Delegamos la creación al InventoryService
         """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        detalles_data = serializer.validated_data.pop("detalles_input", [])
-        if not detalles_data:
-            raise ValidationError({"detalles_input": "Debe enviar al menos un detalle."})
-
-        # ✅ Crear nota (tu serializer.create ya crea insumos manuales si envías insumos_input)
-        nota = serializer.save()
-
-        # ✅ Crear detalles
-        NotaEnsambleDetalle.objects.bulk_create(
-            [
-                NotaEnsambleDetalle(
-                    nota=nota,
-                    cantidad_disponible=d["cantidad"],
-                    bodega_actual=nota.bodega,
-                    **d
-                )
-                for d in detalles_data
-            ]
-        )
-
-        nota.refresh_from_db()
-
-        # ✅ Aplicar receta/stock
-        self._aplicar_detalles(nota, nota.detalles.all(), signo=Decimal("1"))
-
-        # ✅ Aplicar insumos manuales (multiplicando por total productos)
-        self._aplicar_insumos_manuales(nota, signo=Decimal("1"))
-
+        nota = InventoryService.create_assembly_note(serializer, serializer.validated_data)
+        
         return Response(self.get_serializer(nota).data, status=status.HTTP_201_CREATED)
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
         """
-        Permite edición parcial segura:
-        - Si solo se edita metadata (fecha, observaciones, tercero), se permite siempre.
-        - Si se cambia stock/receta (cantidades, productos, insumos manuales, bodega),
-          se bloquea si existen ventas o traslados asociados.
+        Delegamos la actualización segura al InventoryService
         """
         nota = self.get_object()
         data = request.data
 
-        # 1. Identificar cambios críticos
+        # 1. Identificar cambios críticos (igual que antes para validaciones rápidas)
         has_detalles_input = "detalles_input" in data
         has_insumos_input = "insumos_input" in data
         has_bodega_change = "bodega_id" in data and int(data["bodega_id"]) != nota.bodega_id
 
         is_critical_change = has_detalles_input or has_insumos_input or has_bodega_change
 
-        # 2. Si es un cambio crítico, validar seguridad
         if is_critical_change:
-            # 🚫 Bloquear si hay productos en otra bodega (solo si bodega_actual no es null y es distinta a la original)
+            # Validaciones de seguridad (Bloqueos si ya se usó la nota)
             details_in_other_bodega = nota.detalles.filter(bodega_actual__isnull=False).exclude(bodega_actual_id=nota.bodega_id).exists()
             if details_in_other_bodega:
                 raise ValidationError({
-                    "detail": (
-                        "Esta nota tiene productos trasladados a otra bodega. "
-                        "Para cambiar cantidades o productos, debes revertir los traslados."
-                    ),
+                    "detail": "Esta nota tiene productos trasladados a otra bodega. Revierta traslados.",
                     "code": "NOTA_CON_TRASLADOS"
                 })
 
-            # 🚫 Bloquear si hay ventas (afectaciones)
             if NotaSalidaAfectacionStock.objects.filter(detalle_stock__nota=nota).exists():
                 raise ValidationError({
-                    "detail": (
-                        "Esta nota tiene productos vendidos (notas de salida). "
-                        "Para cambiar cantidades o productos, debes eliminar las notas de salida asociadas."
-                    ),
+                    "detail": "Esta nota tiene productos vendidos. Elimine las ventas asociadas.",
                     "code": "NOTA_CON_SALIDAS"
                 })
 
-            # 🚫 Bloquear si hay historial de traslados relacionado a sus detalles
             if TrasladoProducto.objects.filter(detalle__nota=nota).exists():
                 raise ValidationError({
-                    "detail": (
-                        "Esta nota tiene historial de traslados. "
-                        "Revierta los traslados antes de modificar productos o cantidades."
-                    ),
+                    "detail": "Esta nota tiene historial de traslados. Revierta traslados.",
                     "code": "NOTA_CON_HISTORIAL_TRASLADOS"
                 })
 
-            # FLUJO CRÍTICO: Revertir anterior y aplicar nuevo
-            # 1) Revertir lo anterior (BOM/stock + manuales)
-            self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"))
-            self._aplicar_insumos_manuales(nota, signo=Decimal("-1"))
+        # 2. Delegar al servicio
+        serializer = self.get_serializer(nota, data=data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        
+        updated_nota = InventoryService.update_assembly_note(nota, serializer, serializer.validated_data)
 
-            # 1b) Limpiar historial de movimientos de esta nota para que no se acumule
-            InsumoMovimiento.objects.filter(nota_ensamble=nota).delete()
-
-            # 2) Validar payload
-            serializer = self.get_serializer(nota, data=data, partial=True)
-            serializer.is_valid(raise_exception=True)
-
-            detalles_data = serializer.validated_data.pop("detalles_input", None)
-            insumos_data = serializer.validated_data.pop("insumos_input", None)
-
-            # 3) Guardar cabecera
-            nota = serializer.save()
-
-            if detalles_data is not None:
-                nota.detalles.all().delete()
-                NotaEnsambleDetalle.objects.bulk_create(
-                    [
-                        NotaEnsambleDetalle(
-                            nota=nota,
-                            cantidad_disponible=d["cantidad"],
-                            bodega_actual=nota.bodega,
-                            **d
-                        )
-                        for d in detalles_data
-                    ]
-                )
-
-            # 5) Reemplazar insumos manuales si vienen
-            if insumos_data is not None:
-                nota.insumos.all().delete()
-                objs = []
-                codigos = [i["insumo_codigo"] for i in insumos_data]
-                mapa = {x.codigo: x for x in Insumo.objects.filter(codigo__in=codigos)}
-                for i in insumos_data:
-                    ins = mapa.get(i["insumo_codigo"])
-                    if not ins:
-                        raise ValidationError({"insumos_input": f"Insumo {i['insumo_codigo']} no existe."})
-                    objs.append(NotaEnsambleInsumo(
-                        nota=nota,
-                        insumo=ins,
-                        cantidad=i["cantidad"]
-                    ))
-                NotaEnsambleInsumo.objects.bulk_create(objs)
-
-            nota.refresh_from_db()
-
-            # 6) Aplicar lo nuevo
-            self._aplicar_detalles(nota, nota.detalles.all(), signo=Decimal("1"))
-            self._aplicar_insumos_manuales(nota, signo=Decimal("1"))
-
-        else:
-            # FLUJO SEGURO (METADATA): Solo guardar cabecera
-            serializer = self.get_serializer(nota, data=data, partial=True)
-            serializer.is_valid(raise_exception=True)
-            nota = serializer.save()
-
-        return Response(self.get_serializer(nota).data, status=status.HTTP_200_OK)
+        return Response(self.get_serializer(updated_nota).data, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
@@ -1503,29 +1220,87 @@ class ExcelImportViewSet(viewsets.ViewSet):
     def plantilla_insumos(self, request):
         wb = Workbook()
         ws = wb.active
-        ws.title = "Insumos"
+        ws.title = "PlantillaInsumos"
 
+        # --- Hoja Principal ---
         headers = [
-            "codigo", "nombre", "bodega_id",
-            "cantidad_entrada", "costo_unitario",
-            "tercero_id",
-            "referencia", "factura", "unidad_medida", "color", "stock_minimo", "observacion",
+            "Codigo Producto", "Descripción", "Cantidad Entrada (Stock)",
+            "Costo Unitario", "Marca (Proveedor)", "Color", "Factura", 
+            "Bodega", "Tercero", "Unidad Medida"
         ]
-        ws.append(headers)
-        ws.append([
-            "INS-001", "Tela", 1,
-            "10.000", "2500.00",
-            1,
-            "REF-TELA-01", "FAC-98451", "M", "Blanco", "2.000", "Lote para camisas"
-        ])
+        
+        # Estilos
+        bold_white = Font(bold=True, color="FFFFFF")
+        dark_blue_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        
+        # Escribir headers en fila 2, col 2 (B2)
+        start_row = 2
+        start_col = 2
+        
+        for idx, h in enumerate(headers):
+            cell = ws.cell(row=start_row, column=start_col + idx, value=h)
+            cell.font = bold_white
+            cell.fill = dark_blue_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+            
+            # Ajustar ancho estimado
+            ws.column_dimensions[chr(65 + start_col + idx - 1)].width = len(h) + 5
+            
+        # Ejemplo de datos
+        ws.cell(row=start_row + 1, column=start_col, value="INS-001").alignment = Alignment(horizontal="left")
+        ws.cell(row=start_row + 1, column=start_col + 1, value="Ej: Botón Rojo 5mm")
+        ws.cell(row=start_row + 1, column=start_col + 2, value=100)
+        ws.cell(row=start_row + 1, column=start_col + 3, value=50.00)
+        ws.cell(row=start_row + 1, column=start_col + 4, value="Proveedor ACME")
+        ws.cell(row=start_row + 1, column=start_col + 5, value="Rojo")
+        ws.cell(row=start_row + 1, column=start_col + 6, value="FAC-1234")
+        ws.cell(row=start_row + 1, column=start_col + 7, value="Bodega Principal")
+        ws.cell(row=start_row + 1, column=start_col + 8, value="Proveedor Genérico (ID: 1)")
+        ws.cell(row=start_row + 1, column=start_col + 9, value="UN")
+
+        # --- Hoja Referencias (Ayuda) ---
+        ws_ref = wb.create_sheet("Referencias")
+        ws_ref_headers = ["Unidad (Abreviatura)", "Descripción", "Ejemplo"]
+        
+        for idx, h in enumerate(ws_ref_headers):
+            cell = ws_ref.cell(row=1, column=idx+1, value=h)
+            cell.font = bold_white
+            cell.fill = dark_blue_fill
+            cell.border = border
+            ws_ref.column_dimensions[chr(65 + idx)].width = 25
+
+        referencias = [
+            ("UN", "Unidad / Pieza", "Botones, Cremalleras"),
+            ("M", "Metros", "Tela, Elástico"),
+            ("CM", "Centímetros", "Cinta"),
+            ("KG", "Kilogramos", "Relleno"),
+            ("GR", "Gramos", "Hilo"),
+            ("L", "Litros", "Tintas"),
+            ("PAR", "Par", "Zapatos, Guantes"),
+            ("SET", "Juego / Kit", "Kit de reparación"),
+            ("CAJA", "Caja", "Caja de hilos"),
+            ("ROLLO", "Rollo", "Rollo de tela"),
+        ]
+
+        for r_idx, row_data in enumerate(referencias, start=2):
+            for c_idx, val in enumerate(row_data, start=1):
+                cell = ws_ref.cell(row=r_idx, column=c_idx, value=val)
+                cell.border = border
+
+        # Agregar nota en la hoja principal apuntando a las referencias
+        ws.merge_cells(start_row=start_row - 1, start_column=start_col, end_row=start_row - 1, end_column=start_col + len(headers) - 1)
+        note_cell = ws.cell(row=start_row - 1, column=start_col, value="Nota: Para 'Unidad Medida' consulta la pestaña 'Referencias' para ver las abreviaturas recomendadas.")
+        note_cell.font = Font(italic=True, color="555555", size=9)
 
         buf = io.BytesIO()
         wb.save(buf)
         content = buf.getvalue()
 
-        resp = Response(content, content_type=XLSXRenderer.media_type)
-        resp["Content-Disposition"] = 'attachment; filename="plantilla_insumos.xlsx"'
-        return resp
+        response = Response(content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        response['Content-Disposition'] = 'attachment; filename="plantilla_insumos_cliente.xlsx"'
+        return response
 
     @action(detail=False, methods=["post"], url_path="importar-insumos")
     @transaction.atomic
@@ -1534,142 +1309,269 @@ class ExcelImportViewSet(viewsets.ViewSet):
         if not file:
             raise ValidationError({"file": "Debe enviar un archivo .xlsx en multipart/form-data con key 'file'."})
 
-        file = request.FILES.get("file")
-        if not file:
-            raise ValidationError({"file": "Debe enviar un .xlsx con key 'file'."})
+        # ✅ 1) Default Bodega / Tercero
+        default_bodega_id = request.data.get("bodega_id")
+        default_tercero_id = request.data.get("tercero_id")
 
-        # ✅ 1) tamaño
         if getattr(file, "size", 0) == 0:
             raise ValidationError({"file": "El archivo llegó vacío (0 bytes). Revisa el FormData en el frontend."})
 
-        # ✅ 2) validar firma ZIP: XLSX empieza por bytes 'PK'
+        # ✅ 2) Validar firma ZIP
         head = file.read(4)
         file.seek(0)
         if head[:2] != b"PK":
-            raise ValidationError({
-                "file": (
-                    "El archivo no parece ser un .xlsx real (debe ser Excel ZIP). "
-                    "No lo renombres: descárgalo como 'Microsoft Excel (.xlsx)'."
-                )
-            })
+            raise ValidationError({"file": "El archivo no es un Excel válido (.xlsx)."})
 
-        # ✅ 3) intentar leer
         try:
             wb = load_workbook(filename=file, data_only=True)
         except Exception as e:
             raise ValidationError({"file": f"No se pudo leer el Excel: {str(e)}"})
 
-        if "Insumos" in wb.sheetnames:
-            ws = wb["Insumos"]
-        else:
-            ws = wb.active
+        # Hoja activa
+        ws = wb.active
+        for sheet in wb.sheetnames:
+            if "Insumos" in sheet or "Inventario" in sheet:
+                ws = wb[sheet]
+                break
 
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
-            raise ValidationError({"file": "El Excel está vacío."})
+            raise ValidationError("El Excel está vacío.")
 
-        header = [str(x).strip() if x is not None else "" for x in rows[0]]
-        required = ["codigo", "nombre", "bodega_id", "cantidad_entrada", "costo_unitario", "tercero_id"]
-        missing = [h for h in required if h not in header]
-        if missing:
-            raise ValidationError({"headers": f"Faltan columnas requeridas: {missing}"})
+        # --- Detección inteligente de Header ---
+        # Buscamos en las primeras 10 filas alguna que tenga palabras clave
+        keywords = ["codigo", "descripcion", "producto", "stock", "cantidad", "marca", "bodega", "tercero"]
+        
+        def clean_header(h):
+            if not h: return ""
+            return str(h).lower().replace("ó", "o").replace("í", "i").replace("á", "a").replace("é", "e").replace("ú", "u").replace(".", "").strip()
 
-        idx = {h: header.index(h) for h in header if h}
+        header_row_idx = -1
+        raw_header = []
+        
+        for i, row in enumerate(rows[:10]):
+            cleaned_row = [clean_header(c) for c in row]
+            matches = sum(1 for cell in cleaned_row if any(k in cell for k in keywords))
+            # Si encontramos al menos 2 palabras clave, asumimos que es el header
+            if matches >= 2:
+                header_row_idx = i
+                raw_header = row
+                break
+        
+        if header_row_idx == -1:
+             # Fallback: intentar primera fila si no se encontró nada claro
+             header_row_idx = 0
+             raw_header = rows[0]
+
+        # Mapa de alias (Cliente -> Backend)
+        aliases = {
+            "codigo producto": "codigo", "codigo": "codigo", "referencia": "codigo",
+            "descripción": "nombre", "descripcion": "nombre", "producto": "nombre", "nombre": "nombre",
+            "cantidad entrada (stock)": "cantidad_entrada", "stock actual": "cantidad_entrada", "stock": "cantidad_entrada", 
+            "cantidad": "cantidad_entrada", "entradas": "cantidad_entrada", "cantidad_entrada": "cantidad_entrada",
+            "marca (proveedor)": "proveedor_nombre", "marca": "proveedor_nombre", "fabricante": "proveedor_nombre", "proveedor": "proveedor_nombre",
+            "unidad medida": "unidad_medida", "unidad_medida": "unidad_medida", "unidad": "unidad_medida", "medida": "unidad_medida", "um": "unidad_medida",
+            "# factura": "factura", "factura": "factura",
+            "costo unitario": "costo_unitario", "costo": "costo_unitario",
+            "bodega": "bodega", "id_bodega": "bodega", "bodega_id": "bodega", "bodega*": "bodega",
+            "tercero": "tercero", "id_tercero": "tercero", "tercero_id": "tercero", "tercero*": "tercero",
+            "color": "color",
+            "observacion": "observacion",
+        }
+
+        idx = {}
+        # Normalizamos el header encontrado
+        for i, h in enumerate(raw_header):
+            cleaned = clean_header(h)
+            if cleaned in aliases:
+                key = aliases[cleaned]
+                if key not in idx: idx[key] = i
+            elif cleaned not in idx:
+                idx[cleaned] = i # Fallback
+
+        # Validar requeridos mínimos
+        if "codigo" not in idx:
+             # Generar mensaje amigable
+             msg = f"No se encontró la columna 'Codigo Producto' en la fila de encadenados (fila {header_row_idx+1}). Cabeceras detectadas: {raw_header}"
+             raise ValidationError(msg)
 
         ok = 0
         errores = []
         movimientos_creados = []
 
-        for i, r in enumerate(rows[1:], start=2):
+        # Caches para evitar DB hits masivos
+        cache_bodegas = {b.nombre.lower(): b for b in Bodega.objects.all()} # nombre_lower -> obj
+        cache_bodegas_id = {str(b.id): b for b in cache_bodegas.values()}   # str(id) -> obj
+        cache_bodegas_cod = {b.codigo.lower(): b for b in cache_bodegas.values() if b.codigo} # codigo_lower -> obj
+        
+        cache_terceros = {t.nombre.lower(): t for t in Tercero.objects.all()}
+        cache_terceros_id = {str(t.id): t for t in cache_terceros.values()}
+        cache_terceros_cod = {t.codigo.lower(): t for t in cache_terceros.values() if t.codigo}
+        
+        cache_proveedores = {p.nombre.upper(): p for p in Proveedor.objects.all()}
+
+        default_bodega_obj = None
+        if default_bodega_id:
+             default_bodega_obj = Bodega.objects.filter(pk=default_bodega_id).first()
+
+        default_tercero_obj = None
+        if default_tercero_id:
+             default_tercero_obj = Tercero.objects.filter(pk=default_tercero_id).first()
+
+        # Iterar desde la fila siguiente al header
+        for i, r in enumerate(rows[header_row_idx+1:], start=header_row_idx+2):
             try:
-                codigo = str(r[idx["codigo"]]).strip()
-                nombre = str(r[idx["nombre"]]).strip()
+                def get_val(key, default=None):
+                    if key in idx and idx[key] < len(r):
+                        val = r[idx[key]]
+                        return val if val is not None else default
+                    return default
 
-                bodega_id = r[idx["bodega_id"]]
-                tercero_id = r[idx["tercero_id"]]
+                codigo = str(get_val("codigo", "")).strip()
+                if not codigo: continue
 
-                cantidad_entrada = _parse_decimal(r[idx["cantidad_entrada"]], "cantidad_entrada")
-                costo_unitario = _parse_decimal(r[idx["costo_unitario"]], "costo_unitario")
+                nombre = str(get_val("nombre", "")).strip()
+                
+                # --- Cantidad ---
+                c_raw = get_val("cantidad_entrada", 0)
+                cantidad_entrada = _parse_decimal(c_raw, "cantidad") or Decimal("0")
 
-                if not codigo:
-                    raise ValidationError({"codigo": "Vacío"})
-                if cantidad_entrada is None or cantidad_entrada <= 0:
-                    raise ValidationError({"cantidad_entrada": "Debe ser > 0"})
+                # --- Costo ---
+                costo_raw = get_val("costo_unitario", 0)
+                val_costo = _parse_decimal(costo_raw, "costo") or Decimal("0")
+                # Forzar 2 decimales para evitar error "más de 2 decimales"
+                costo_unitario = val_costo.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-                bodega = Bodega.objects.get(id=int(bodega_id))
-                tercero = Tercero.objects.get(id=int(tercero_id))
+                # --- Resolver Bodega ---
+                # Prioridad: 1. ID exacto, 2. Codigo exacto, 3. Nombre
+                # Excel "0" suele ser string "0". Si codigo es "000", no machea directo.
+                # Intento machear tal cual, y si es "0", intento "000".
+                bodega_val = str(get_val("bodega", "")).strip()
+                bodega_obj = default_bodega_obj
+                
+                if bodega_val:
+                    b_look = bodega_val.lower()
+                    # 1. ID
+                    if bodega_val in cache_bodegas_id:
+                        bodega_obj = cache_bodegas_id[bodega_val]
+                    # 2. Codigo
+                    elif b_look in cache_bodegas_cod:
+                        bodega_obj = cache_bodegas_cod[b_look]
+                    # 2.1 Caso especial "0" -> "000" (si el excel se comió los ceros)
+                    elif b_look == "0" and "000" in cache_bodegas_cod:
+                         bodega_obj = cache_bodegas_cod["000"]
+                    # 3. Nombre
+                    elif b_look in cache_bodegas:
+                         bodega_obj = cache_bodegas[b_look]
+                    else:
+                         raise ValidationError(f"Bodega '{bodega_val}' no encontrada (por ID, Código o Nombre).")
+                
+                if not bodega_obj:
+                    raise ValidationError("Falta especificar Bodega (en archivo o selección global).")
 
-                referencia = (r[idx["referencia"]] if "referencia" in idx else None)
-                factura = (r[idx["factura"]] if "factura" in idx else "")
-                unidad_medida = (r[idx["unidad_medida"]] if "unidad_medida" in idx else "")
-                color = (r[idx["color"]] if "color" in idx else "")
-                stock_minimo = _parse_decimal(r[idx["stock_minimo"]], "stock_minimo") if "stock_minimo" in idx else None
-                observacion = (r[idx["observacion"]] if "observacion" in idx else "")
+                # --- Resolver Tercero ---
+                tercero_val = str(get_val("tercero", "")).strip()
+                tercero_obj = default_tercero_obj
+                
+                if tercero_val:
+                    t_look = tercero_val.lower()
+                    if tercero_val in cache_terceros_id:
+                        tercero_obj = cache_terceros_id[tercero_val]
+                    elif t_look in cache_terceros_cod: # Codigo
+                        tercero_obj = cache_terceros_cod[t_look]
+                    elif t_look in cache_terceros: # Nombre
+                         tercero_obj = cache_terceros[t_look]
+                    else:
+                         raise ValidationError(f"Tercero '{tercero_val}' no encontrado.")
+                
+                if not tercero_obj:
+                    raise ValidationError("Falta especificar Tercero (en archivo o selección global).")
 
+                # --- Otros campos ---
+                prov_nombre = str(get_val("proveedor_nombre", "")).strip()
+                proveedor_obj = None
+                if prov_nombre:
+                    p_upper = prov_nombre.upper()
+                    if p_upper in cache_proveedores:
+                        proveedor_obj = cache_proveedores[p_upper]
+                    else:
+                        # Crear proveedor on the fly si no existe
+                        proveedor_obj = Proveedor.objects.create(nombre=prov_nombre)
+                        cache_proveedores[p_upper] = proveedor_obj
+
+                observacion = str(get_val("observacion", "")).strip()
+                color = str(get_val("color", "")).strip()
+                factura = str(get_val("factura", "")).strip()
+                unidad_medida = str(get_val("unidad_medida", "")).strip().upper() # Capturar unidad
+
+                # --- Lógica de Creación / Actualización ---
                 insumo = Insumo.objects.filter(codigo=codigo).first()
+                insumo_existed = True
+
                 if not insumo:
+                    insumo_existed = False
                     insumo = Insumo.objects.create(
                         codigo=codigo,
-                        nombre=nombre,
-                        bodega=bodega,
-                        referencia=str(referencia).strip() if referencia else codigo,
-                        factura=str(factura or "").strip(),
-                        unidad_medida=str(unidad_medida or "").strip(),
-                        color=str(color or "").strip(),
-                        stock_minimo=stock_minimo if stock_minimo is not None else Decimal("0"),
-                        observacion=str(observacion or "").strip(),
-                        costo_unitario=(costo_unitario.quantize(Decimal("0.01")) if costo_unitario else Decimal("0.00")),
-                        cantidad=Decimal("0.000"),
-                        tercero=tercero,
+                        nombre=nombre or f"Insumo {codigo}",
+                        proveedor=proveedor_obj,
+                        bodega=bodega_obj,
+                        color=color,
+                        factura=factura,
+                        observacion=observacion,
+                        referencia=codigo,
+                        unidad_medida=unidad_medida # Guardar unidad
                     )
-                    # Registrar CREACION (sin afectar stock) si quieres dejarlo marcado
                     registrar_movimiento_sin_afectar_stock(
-                        insumo=insumo,
-                        tercero=tercero,
-                        tipo="CREACION",
-                        cantidad=Decimal("0.000"),
-                        costo_unitario=insumo.costo_unitario,
-                        bodega=bodega,
-                        factura=insumo.factura,
-                        observacion="Creación por importación Excel",
+                        insumo=insumo, tercero=tercero_obj, tipo="CREACION",
+                        cantidad=Decimal("0"), costo_unitario=costo_unitario,
+                        bodega=bodega_obj, observacion="Auto-creado Import"
                     )
                 else:
-                    # actualiza metadata sin tocar cantidad aún (la cantidad la suma el movimiento)
-                    insumo.nombre = nombre or insumo.nombre
-                    insumo.bodega = bodega
-                    insumo.tercero = tercero
-                    if referencia:
-                        insumo.referencia = str(referencia).strip()
-                    if factura is not None:
-                        insumo.factura = str(factura or "").strip()
-                    if unidad_medida is not None:
-                        insumo.unidad_medida = str(unidad_medida or "").strip()
-                    if color is not None:
-                        insumo.color = str(color or "").strip()
-                    if stock_minimo is not None:
-                        insumo.stock_minimo = stock_minimo
-                    if observacion is not None:
-                        insumo.observacion = str(observacion or "").strip()
-                    # si viene costo_unitario en el excel, puedes actualizar el “último” costo del insumo
-                    if costo_unitario is not None:
-                        insumo.costo_unitario = costo_unitario.quantize(Decimal("0.01"))
+                    # Si ya existe, actualizamos metadata básica pero NO stock
+                    if nombre: insumo.nombre = nombre
+                    if proveedor_obj: insumo.proveedor = proveedor_obj
+                    if color: insumo.color = color
+                    if unidad_medida: insumo.unidad_medida = unidad_medida # Actualizar unidad si viene
                     insumo.save()
 
-                mov = aplicar_movimiento_insumo(
-                    insumo=insumo,
-                    tercero=tercero,
-                    tipo="ENTRADA",
-                    cantidad=cantidad_entrada,
-                    costo_unitario=costo_unitario.quantize(Decimal("0.01")) if costo_unitario else None,
-                    bodega=bodega,
-                    factura=str(factura or "").strip(),
-                    observacion=f"Entrada por importación Excel (fila {i})",
-                )
-                movimientos_creados.append(mov.id)
+                # Registrar entrada si viene cantidad > 0, SEA NUEVO O EXISTENTE
+                # (Interpretando la columna como "Cantidad a sumar")
+                if cantidad_entrada > 0:
+                    # ✅ Si el insumo YA existía, usamos su costo actual para evitar distorsiones por error en Excel
+                    # Salvo que el insumo tenga costo 0, entonces intentamos usar el del Excel.
+                    costo_para_movimiento = costo_unitario
+                    if insumo_existed and insumo.costo_unitario > 0:
+                         costo_para_movimiento = insumo.costo_unitario
+
+                    mov = aplicar_movimiento_insumo(
+                        insumo=insumo,
+                        tercero=tercero_obj,
+                        tipo="ENTRADA",
+                        cantidad=cantidad_entrada,
+                        costo_unitario=costo_para_movimiento,
+                        bodega=bodega_obj,
+                        factura=factura,
+                        observacion=observacion
+                    )
+                    movimientos_creados.append(mov.id)
+                
                 ok += 1
 
             except Exception as e:
-                errores.append({"fila": i, "error": str(e)})
+                # Extraer mensaje limpio si es ValidationError de DRF
+                msg = str(e)
+                if hasattr(e, 'detail'):
+                    d = e.detail
+                    if isinstance(d, list):
+                        # [ErrorDetail(string='Msg', code='invalid')]
+                        msg = " ".join([str(x) for x in d])
+                    elif isinstance(d, dict):
+                        # {'field': ['Error']}
+                        msg = " | ".join([f"{k}: {' '.join([str(x) for x in v]) if isinstance(v, list) else str(v)}" for k, v in d.items()])
+                    else:
+                        msg = str(d)
+                
+                errores.append({"fila": i, "error": msg})
 
         return Response(
             {

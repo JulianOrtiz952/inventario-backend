@@ -448,49 +448,9 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
             })
         return attrs
 
-    @transaction.atomic
-    def create(self, validated_data):
-        detalles_data = validated_data.pop("detalles_input", [])
-        insumos_data = validated_data.pop("insumos_input", [])
-
-        nota = NotaEnsamble.objects.create(**validated_data)
-
-        # 1) Detalles (productos terminados)
-        NotaEnsambleDetalle.objects.bulk_create(
-            [NotaEnsambleDetalle(nota=nota, **d) for d in detalles_data]
-        )
-
-        # 2) Insumos consumidos (solo guardar la relación Nota->Insumo)
-        if insumos_data:
-            # Traer insumos
-            codigos = [x["insumo_codigo"] for x in insumos_data]
-            insumos_qs = Insumo.objects.filter(codigo__in=codigos)
-            insumos_map = {i.codigo: i for i in insumos_qs}
-
-            insumo_objs = []
-            for item in insumos_data:
-                codigo = item["insumo_codigo"]
-                cantidad = item["cantidad"]
-
-                ins = insumos_map.get(codigo)
-                if not ins:
-                    raise serializers.ValidationError({"insumos_input": f"Insumo {codigo} no existe."})
-
-                if cantidad is None or cantidad <= 0:
-                    raise serializers.ValidationError({"cantidad": f"La cantidad debe ser > 0 para {codigo}."})
-
-                # Solo creamos la relación. El descuento de stock y Kardex lo hace el ViewSet.
-                insumo_objs.append(
-                    NotaEnsambleInsumo(
-                        nota=nota,
-                        insumo=ins,
-                        cantidad=cantidad
-                    )
-                )
-
-            NotaEnsambleInsumo.objects.bulk_create(insumo_objs)
-
-        return nota
+    # El método create se ha movido a InventoryService para centralizar la lógica.
+    # def create(self, validated_data):
+    #     ...
 
 
 class TrasladoProductoSerializer(serializers.ModelSerializer):
