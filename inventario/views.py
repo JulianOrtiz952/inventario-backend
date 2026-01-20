@@ -21,7 +21,7 @@ from django.utils import timezone
 
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
-    Tercero, DatosAdicionalesProducto, Talla,
+    Tercero, Operador, DatosAdicionalesProducto, Talla,
     NotaEnsamble, ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo,
     TrasladoProducto, NotaSalidaProducto, NotaSalidaAfectacionStock, InsumoMovimiento,
     ProductoTerminadoMovimiento
@@ -30,7 +30,7 @@ from .filters import InsumoFilter, ProductoFilter, NotaEnsambleFilter, NotaSalid
 from .serializers import (
     InsumoSerializer, ProveedorSerializer, ProductoSerializer, BodegaSerializer,
     ImpuestoSerializer, ProductoPrecioWriteSerializer,
-    TerceroSerializer, DatosAdicionalesWriteSerializer,
+    TerceroSerializer, OperadorSerializer, DatosAdicionalesWriteSerializer,
     TallaSerializer, NotaEnsambleSerializer, NotaEnsambleListSerializer, ProductoInsumoSerializer,
     TrasladoProductoSerializer, NotaSalidaProductoSerializer, NotaSalidaProductoListSerializer,
     InsumoMovimientoSerializer, InsumoMovimientoInputSerializer,
@@ -279,10 +279,10 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         # ✅ SQL Annotations: costo_total e items_count
         # Esto evita N+1 en la lista y cálculos costosos en Python
         qs = NotaEnsamble.objects.annotate(
-            costo_total=Coalesce(Sum("insumomovimientos__total"), Value(0, output_field=DecimalField())),
+            costo_total=Coalesce(Sum("insumomovimientos__total"), Value(0, output_field=DecimalField())) + F("costo_servicio"),
             total_cantidad=Coalesce(Sum("detalles__cantidad"), Value(0, output_field=DecimalField())),
             items_count=Count("detalles", distinct=True)
-        ).select_related("bodega", "tercero").order_by("-id")
+        ).select_related("bodega", "tercero", "operador").order_by("-id")
 
 
         if self.action == "list":
@@ -561,6 +561,17 @@ class BodegaViewSet(viewsets.ModelViewSet):
 class TerceroViewSet(viewsets.ModelViewSet):
     queryset = Tercero.objects.all().order_by("-es_activo", "codigo")
     serializer_class = TerceroSerializer
+    search_fields = ["nombre", "codigo"]
+    ordering_fields = ["nombre", "es_activo"]
+
+    def perform_destroy(self, instance):
+        instance.es_activo = False
+        instance.save(update_fields=["es_activo"])
+
+
+class OperadorViewSet(viewsets.ModelViewSet):
+    queryset = Operador.objects.all().order_by("-es_activo", "codigo")
+    serializer_class = OperadorSerializer
     search_fields = ["nombre", "codigo"]
     ordering_fields = ["nombre", "es_activo"]
 
@@ -1584,7 +1595,8 @@ class ExcelImportViewSet(viewsets.ViewSet):
                         factura=factura,
                         observacion=observacion,
                         referencia=referencia_val,
-                        unidad_medida=unidad_medida # Guardar unidad
+                        unidad_medida=unidad_medida, # Guardar unidad
+                        costo_unitario=costo_unitario # ✅ Guardar costo inicial
                     )
                     registrar_movimiento_sin_afectar_stock(
                         insumo=insumo, tercero=tercero_obj, tipo="CREACION",
@@ -1597,16 +1609,19 @@ class ExcelImportViewSet(viewsets.ViewSet):
                     if proveedor_obj: insumo.proveedor = proveedor_obj
                     if color: insumo.color = color
                     if unidad_medida: insumo.unidad_medida = unidad_medida # Actualizar unidad si viene
+                    
+                    # ✅ Actualizar costo si viene en el Excel
+                    if costo_unitario > 0:
+                        insumo.costo_unitario = costo_unitario
+                    
                     insumo.save()
 
                 # Registrar entrada si viene cantidad > 0, SEA NUEVO O EXISTENTE
                 # (Interpretando la columna como "Cantidad a sumar")
                 if cantidad_entrada > 0:
-                    # ✅ Si el insumo YA existía, usamos su costo actual para evitar distorsiones por error en Excel
-                    # Salvo que el insumo tenga costo 0, entonces intentamos usar el del Excel.
+                    # ✅ Usar SIEMPRE el costo del Excel para el movimiento de entrada
+                    # (Anteriormente se priorizaba el costo viejo si existía)
                     costo_para_movimiento = costo_unitario
-                    if insumo_existed and insumo.costo_unitario > 0:
-                         costo_para_movimiento = insumo.costo_unitario
 
                     mov = aplicar_movimiento_insumo(
                         insumo=insumo,

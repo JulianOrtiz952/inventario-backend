@@ -24,6 +24,11 @@ from inventario.models import (
     NotaSalidaProducto, NotaSalidaProductoDetalle,
 )
 
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from .renderers import XLSXRenderer
+import io
+
 # ============================================================
 # Helpers: tipado DECIMAL (evita mixed types)
 # ============================================================
@@ -201,10 +206,10 @@ class ReporteResumenAPIView(APIView):
             "notas_salida_count": sal.count(),
             "salidas_unidades": _dec_str(salidas_unidades),
             "salidas_valor_costo": _dec_str(salidas_valor_costo),
-            "notas_ensamble_count": ens.count(),
             "produccion_unidades": _dec_str(produccion_unidades),
             "traslados_count": tr.count(),
             "traslados_unidades": _dec_str(traslados_unidades),
+            "costo_servicio_operadores": _dec_str(ens.aggregate(x=Coalesce(Sum("costo_servicio"), D0(), output_field=DEC))["x"]),
         }
 
         # -------------------------
@@ -605,7 +610,79 @@ class ReporteProduccionTopProducidosAPIView(APIView):
 
 
 # ============================================================
-# 5) BODEGAS / INVENTARIO (snapshot)
+# 5) OPERADORES
+# ============================================================
+
+class ReporteOperadoresResumenAPIView(APIView):
+    """
+    GET /api/reportes/operadores/resumen/
+    Resumen de trabajo por operador: notas, unidades y costo de servicio.
+    """
+
+    def get(self, request):
+        f = _get_filters(request)
+
+        ens = NotaEnsamble.objects.filter(operador__isnull=False)
+        ens = _apply_date_range_date(ens, "fecha_elaboracion", f)
+        if f["bodega_id"]:
+            ens = ens.filter(bodega_id=f["bodega_id"])
+        if f["tercero_id"]:
+            ens = ens.filter(tercero_id=f["tercero_id"])
+
+        rows = (
+            ens.values("operador_id", "operador__nombre")
+            .annotate(
+                notas_count=Count("id"),
+                total_unidades=Coalesce(Sum("detalles__cantidad"), D0_3(), output_field=DEC3),
+                total_costo_servicio=Coalesce(Sum("costo_servicio"), D0(), output_field=DEC),
+            )
+            .order_by("-total_unidades")
+        )
+
+        labels = [x["operador__nombre"] for x in rows]
+
+        return Response(
+            {
+                "ok": True,
+                "filters": _filters_payload(f),
+                "kpis": {
+                    "total_operadores": len(rows),
+                    "total_servicio": _dec_str(sum((x["total_costo_servicio"] for x in rows), start=Decimal("0.00"))),
+                },
+                "charts": [
+                    {
+                        "id": "operadores_unidades",
+                        "type": "bar",
+                        "title": "Unidades por Operador",
+                        "unit": "unidades",
+                        "labels": labels,
+                        "series": [{"name": "Unidades", "data": [_dec_str(x["total_unidades"]) for x in rows]}],
+                    },
+                    {
+                        "id": "operadores_costo",
+                        "type": "bar",
+                        "title": "Costo Servicio por Operador",
+                        "unit": "valor",
+                        "labels": labels,
+                        "series": [{"name": "Valor", "data": [_dec_str(x["total_costo_servicio"]) for x in rows]}],
+                    }
+                ],
+                "rows": [
+                    {
+                        "operador": x["operador__nombre"],
+                        "notas_realizadas": x["notas_count"],
+                        "unidades_producidas": _dec_str(x["total_unidades"]),
+                        "costo_servicio_total": _dec_str(x["total_costo_servicio"]),
+                    }
+                    for x in rows
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ============================================================
+# 6) BODEGAS / INVENTARIO (snapshot)
 # ============================================================
 
 class ReporteBodegasStockAPIView(APIView):
@@ -783,3 +860,160 @@ class ReporteNotasSalidasResumenAPIView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# ============================================================
+# 7) EXPORTAR TODO A EXCEL
+# ============================================================
+
+class ReporteExportarExcelCompletoAPIView(APIView):
+    """
+    GET /api/reportes/exportar-excel/?fecha_desde=...&fecha_hasta=...&bodega_id=...&tercero_id=...
+    Genera un archivo Excel con múltiples pestañas (insumos, productos, notas de ensamble y salida).
+    """
+    renderer_classes = [XLSXRenderer]
+
+    def get(self, request):
+        f = _get_filters(request)
+        
+        wb = Workbook()
+        # Eliminar hoja por defecto si existe
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+        
+        # Estilos corporativos (Basados en ExcelImportViewSet)
+        bold_white = Font(bold=True, color="FFFFFF")
+        dark_blue_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        center_align = Alignment(horizontal="center", vertical="center")
+
+        def write_header(ws, headers):
+            for idx, h in enumerate(headers, start=1):
+                cell = ws.cell(row=1, column=idx, value=h)
+                cell.font = bold_white
+                cell.fill = dark_blue_fill
+                cell.alignment = center_align
+                cell.border = border
+                # Ajuste de ancho básico
+                ws.column_dimensions[chr(64 + idx)].width = 20
+
+        # --- 1. Pestaña: Insumos ---
+        ws_ins = wb.create_sheet("Insumos")
+        headers_ins = ["Código", "Referencia", "Nombre", "Stock Actual", "Costo Unitario", "Unidad", "Bodega", "Tercero", "Color"]
+        write_header(ws_ins, headers_ins)
+        
+        ins_qs = Insumo.objects.select_related("bodega", "tercero", "proveedor").all()
+        if f["bodega_id"]: ins_qs = ins_qs.filter(bodega_id=f["bodega_id"])
+        if f["tercero_id"]: ins_qs = ins_qs.filter(tercero_id=f["tercero_id"])
+
+        for r_idx, obj in enumerate(ins_qs, start=2):
+            ws_ins.cell(row=r_idx, column=1, value=obj.codigo)
+            ws_ins.cell(row=r_idx, column=2, value=obj.referencia)
+            ws_ins.cell(row=r_idx, column=3, value=obj.nombre)
+            ws_ins.cell(row=r_idx, column=4, value=float(obj.cantidad))
+            ws_ins.cell(row=r_idx, column=5, value=float(obj.costo_unitario))
+            ws_ins.cell(row=r_idx, column=6, value=obj.unidad_medida)
+            ws_ins.cell(row=r_idx, column=7, value=obj.bodega.nombre)
+            ws_ins.cell(row=r_idx, column=8, value=obj.tercero.nombre if obj.tercero else "")
+            ws_ins.cell(row=r_idx, column=9, value=obj.color)
+
+        # --- 2. Pestaña: Productos ---
+        ws_prod = wb.create_sheet("Productos")
+        headers_prod = ["SKU", "Nombre", "Unidad", "Stock Global", "Precio Total", "Tercero"]
+        write_header(ws_prod, headers_prod)
+        
+        prod_qs = Producto.objects.select_related("tercero", "datos_adicionales").all()
+        if f["tercero_id"]: prod_qs = prod_qs.filter(tercero_id=f["tercero_id"])
+
+        for r_idx, obj in enumerate(prod_qs, start=2):
+            ws_prod.cell(row=r_idx, column=1, value=obj.codigo_sku)
+            ws_prod.cell(row=r_idx, column=2, value=obj.nombre)
+            ws_prod.cell(row=r_idx, column=3, value=obj.unidad_medida)
+            stock = getattr(obj.datos_adicionales, "stock", 0) if hasattr(obj, "datos_adicionales") else 0
+            ws_prod.cell(row=r_idx, column=4, value=float(stock))
+            ws_prod.cell(row=r_idx, column=5, value=float(obj.precio_total))
+            ws_prod.cell(row=r_idx, column=6, value=obj.tercero.nombre if obj.tercero else "")
+
+        # --- 3. Pestaña: Notas de Ensamble ---
+        ws_ens = wb.create_sheet("Notas Ensamble")
+        headers_ens = ["ID", "Fecha", "Bodega Destino", "Tercero", "Operador", "Costo Servicio", "Observaciones"]
+        write_header(ws_ens, headers_ens)
+        
+        ens_qs = NotaEnsamble.objects.select_related("bodega", "tercero", "operador").all()
+        ens_qs = _apply_date_range_date(ens_qs, "fecha_elaboracion", f)
+        if f["bodega_id"]: ens_qs = ens_qs.filter(bodega_id=f["bodega_id"])
+        if f["tercero_id"]: ens_qs = ens_qs.filter(tercero_id=f["tercero_id"])
+
+        for r_idx, obj in enumerate(ens_qs, start=2):
+            ws_ens.cell(row=r_idx, column=1, value=obj.id)
+            ws_ens.cell(row=r_idx, column=2, value=str(obj.fecha_elaboracion))
+            ws_ens.cell(row=r_idx, column=3, value=obj.bodega.nombre)
+            ws_ens.cell(row=r_idx, column=4, value=obj.tercero.nombre if obj.tercero else "")
+            ws_ens.cell(row=r_idx, column=5, value=obj.operador.nombre if obj.operador else "")
+            ws_ens.cell(row=r_idx, column=6, value=float(obj.costo_servicio or 0))
+            ws_ens.cell(row=r_idx, column=7, value=obj.observaciones)
+
+        # --- 4. Pestaña: Operadores ---
+        ws_ope = wb.create_sheet("Operadores")
+        headers_ope = ["Operador", "Notas Realizadas", "Unidades Producidas", "Costo Servicio Total"]
+        write_header(ws_ope, headers_ope)
+
+        ope_qs = (
+            NotaEnsamble.objects.filter(operador__isnull=False)
+            .values("operador__nombre")
+            .annotate(
+                notas_count=Count("id"),
+                total_unidades=Coalesce(Sum("detalles__cantidad"), D0_3(), output_field=DEC3),
+                total_costo_servicio=Coalesce(Sum("costo_servicio"), D0(), output_field=DEC),
+            )
+            .order_by("-total_unidades")
+        )
+        # Re-aplicar filtros si es necesario (el query base no los tiene aplicados)
+        # nota: filtrarlos aquí requiere duplicar lógica de _apply_date_range_date o pasar el queryset filtrado.
+        # vamos a filtrar ope_qs basado en NotaEnsamble filtrado
+        ens_filtered = NotaEnsamble.objects.filter(operador__isnull=False)
+        ens_filtered = _apply_date_range_date(ens_filtered, "fecha_elaboracion", f)
+        if f["bodega_id"]: ens_filtered = ens_filtered.filter(bodega_id=f["bodega_id"])
+        if f["tercero_id"]: ens_filtered = ens_filtered.filter(tercero_id=f["tercero_id"])
+        
+        ope_rows = (
+            ens_filtered.values("operador__nombre")
+            .annotate(
+                notas_count=Count("id"),
+                total_unidades=Coalesce(Sum("detalles__cantidad"), D0_3(), output_field=DEC3),
+                total_costo_servicio=Coalesce(Sum("costo_servicio"), D0(), output_field=DEC),
+            )
+            .order_by("-total_unidades")
+        )
+
+        for r_idx, row in enumerate(ope_rows, start=2):
+            ws_ope.cell(row=r_idx, column=1, value=row["operador__nombre"])
+            ws_ope.cell(row=r_idx, column=2, value=row["notas_count"])
+            ws_ope.cell(row=r_idx, column=3, value=float(row["total_unidades"]))
+            ws_ope.cell(row=r_idx, column=4, value=float(row["total_costo_servicio"]))
+
+        # --- 5. Pestaña: Notas de Salida ---
+        ws_sal = wb.create_sheet("Notas Salida")
+        headers_sal = ["Número", "Fecha", "Bodega Origen", "Cliente/Tercero", "Observación"]
+        write_header(ws_sal, headers_sal)
+        
+        sal_qs = NotaSalidaProducto.objects.select_related("bodega", "tercero").all()
+        sal_qs = _apply_date_range_date(sal_qs, "fecha", f)
+        if f["bodega_id"]: sal_qs = sal_qs.filter(bodega_id=f["bodega_id"])
+        if f["tercero_id"]: sal_qs = sal_qs.filter(tercero_id=f["tercero_id"])
+
+        for r_idx, obj in enumerate(sal_qs, start=2):
+            ws_sal.cell(row=r_idx, column=1, value=obj.numero)
+            ws_sal.cell(row=r_idx, column=2, value=str(obj.fecha))
+            ws_sal.cell(row=r_idx, column=3, value=obj.bodega.nombre)
+            ws_sal.cell(row=r_idx, column=4, value=obj.tercero.nombre if obj.tercero else "")
+            ws_sal.cell(row=r_idx, column=5, value=obj.observacion)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        content = buf.getvalue()
+        
+        filename = f"reporte_consolidado_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        response = Response(content, content_type=XLSXRenderer.media_type)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response

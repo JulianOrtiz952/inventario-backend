@@ -4,7 +4,7 @@ from rest_framework.routers import DefaultRouter
 
 from inventario.views import (
     InsumoViewSet, ProveedorViewSet, ProductoViewSet, BodegaViewSet,
-    ImpuestoViewSet, PrecioProductoViewSet, TerceroViewSet,
+    ImpuestoViewSet, PrecioProductoViewSet, TerceroViewSet, OperadorViewSet,
     DatosAdicionalesProductoViewSet, TallaViewSet, NotaEnsambleViewSet,
     ProductoInsumoViewSet, TrasladoProductoViewSet, NotaSalidaProductoViewSet, InsumoMovimientoViewSet,
     ExcelImportViewSet
@@ -16,6 +16,7 @@ router.register(r"proveedores", ProveedorViewSet, basename="proveedor")
 router.register(r"bodegas", BodegaViewSet, basename="bodega")
 
 router.register(r"terceros", TerceroViewSet, basename="tercero")
+router.register(r"operadores", OperadorViewSet, basename="operador")
 router.register(r"impuestos", ImpuestoViewSet, basename="impuesto")
 
 router.register(r"productos", ProductoViewSet, basename="producto")

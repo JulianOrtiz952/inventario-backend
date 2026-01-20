@@ -2,6 +2,7 @@ from rest_framework import serializers
 from .models import (
     Insumo, Proveedor, Producto, Bodega, Impuesto, PrecioProducto,
     Tercero, DatosAdicionalesProducto, Talla, NotaEnsamble,
+    Operador,
     ProductoInsumo, NotaEnsambleDetalle, NotaEnsambleInsumo, TrasladoProducto,
     NotaSalidaProducto, NotaSalidaProductoDetalle, NotaSalidaAfectacionStock, InsumoMovimiento, ProductoTerminadoMovimiento
 )
@@ -34,6 +35,12 @@ class BodegaSerializer(serializers.ModelSerializer):
 class TerceroSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tercero
+        fields = ["id", "codigo", "nombre", "es_activo"]
+
+
+class OperadorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Operador
         fields = ["id", "codigo", "nombre", "es_activo"]
 
 
@@ -392,6 +399,7 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
 
     bodega = BodegaSerializer(read_only=True)
     tercero = TerceroSerializer(read_only=True)
+    operador = OperadorSerializer(read_only=True)
 
     costo_total = serializers.SerializerMethodField(read_only=True)
 
@@ -410,6 +418,14 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
         allow_null=True
     )
 
+    operador_id = serializers.PrimaryKeyRelatedField(
+        queryset=Operador.objects.all(),
+        source="operador",
+        write_only=True,
+        required=False,
+        allow_null=True
+    )
+
     detalles_input = NotaEnsambleDetalleWriteSerializer(many=True, write_only=True)
     insumos_input = NotaEnsambleInsumoWriteSerializer(many=True, write_only=True, required=False)
 
@@ -423,21 +439,26 @@ class NotaEnsambleSerializer(serializers.ModelSerializer):
             # lectura rica
             "bodega",
             "tercero",
+            "operador",
             "detalles",
             "insumos",
             "movimientos",
             "costo_total",
+            "costo_servicio",
 
             # escritura por ids + payloads
             "bodega_id",
             "tercero_id",
+            "operador_id",
             "detalles_input",
             "insumos_input",
+            "costo_servicio",
         ]
 
     def get_costo_total(self, obj):
         movs = obj.insumomovimientos.all()
-        total = sum(m.total for m in movs) if movs.exists() else 0
+        total_movs = sum(m.total for m in movs) if movs.exists() else 0
+        total = total_movs + (obj.costo_servicio or 0)
         return str(total)
 
 class NotaEnsambleListSerializer(serializers.ModelSerializer):
@@ -445,6 +466,7 @@ class NotaEnsambleListSerializer(serializers.ModelSerializer):
     """Versión ligera para el Historial/Lista"""
     bodega_nombre = serializers.CharField(source="bodega.nombre", read_only=True)
     tercero_nombre = serializers.CharField(source="tercero.nombre", read_only=True)
+    operador_nombre = serializers.CharField(source="operador.nombre", read_only=True)
     costo_total = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True) 
     total_cantidad = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
     productos_resumen = serializers.SerializerMethodField(read_only=True)
@@ -457,7 +479,10 @@ class NotaEnsambleListSerializer(serializers.ModelSerializer):
             "fecha_elaboracion",
             "bodega_nombre",
             "tercero_nombre",
+            "operador_nombre",
+            "operador_id",
             "costo_total",
+            "costo_servicio",
             "total_cantidad",
             "productos_resumen",
             "observaciones",
@@ -484,8 +509,13 @@ class NotaEnsambleListSerializer(serializers.ModelSerializer):
 
 
     def get_costo_total(self, obj):
+        # Si fue anotado en el queryset (lo cual hicimos en views.py)
+        if hasattr(obj, "costo_total"):
+            return str(obj.costo_total)
+
         movs = obj.insumomovimientos.all()
-        total = sum(m.total for m in movs) if movs.exists() else 0
+        total_movs = sum(m.total for m in movs) if movs.exists() else 0
+        total = total_movs + (obj.costo_servicio or 0)
         return str(total)
 
 

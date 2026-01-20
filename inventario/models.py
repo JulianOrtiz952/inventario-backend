@@ -31,6 +31,15 @@ class Tercero(models.Model):
         return f"{self.codigo} - {self.nombre}"
 
 
+class Operador(models.Model):
+    codigo = models.CharField(max_length=50, unique=True)
+    nombre = models.CharField(max_length=150, db_index=True)
+    es_activo = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"{self.codigo} - {self.nombre}"
+
+
 class Bodega(models.Model):
     codigo = models.CharField(max_length=50, unique=True)
     nombre = models.CharField(max_length=100, unique=True, db_index=True)
@@ -276,8 +285,10 @@ class Insumo(models.Model):
 class NotaEnsamble(models.Model):
     bodega = models.ForeignKey("Bodega", on_delete=models.PROTECT, related_name="notas_ensamble")
     tercero = models.ForeignKey("Tercero", on_delete=models.PROTECT, null=True, blank=True, related_name="notas_ensamble")
+    operador = models.ForeignKey("Operador", on_delete=models.PROTECT, null=True, blank=True, related_name="notas_ensamble")
     fecha_elaboracion = models.DateField(default=timezone.now)
     observaciones = models.TextField(null=True, blank=True)
+    costo_servicio = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
 
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)

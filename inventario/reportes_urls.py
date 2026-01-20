@@ -9,6 +9,8 @@ from inventario.reportes import (
     ReporteProduccionTopProducidosAPIView,
     ReporteBodegasStockAPIView,
     ReporteNotasSalidasResumenAPIView,
+    ReporteOperadoresResumenAPIView,
+    ReporteExportarExcelCompletoAPIView,
 )
 
 urlpatterns = [
@@ -20,4 +22,6 @@ urlpatterns = [
     path("produccion/top-producidos/", ReporteProduccionTopProducidosAPIView.as_view()),
     path("bodegas/stock/", ReporteBodegasStockAPIView.as_view()),
     path("notas/salidas/resumen/", ReporteNotasSalidasResumenAPIView.as_view()),
+    path("operadores/resumen/", ReporteOperadoresResumenAPIView.as_view()),
+    path("exportar-excel/", ReporteExportarExcelCompletoAPIView.as_view()),
 ]
