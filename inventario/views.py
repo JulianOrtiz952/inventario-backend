@@ -371,7 +371,8 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         """
-        Bloquea eliminación si hay registrados movimientos que dependan de esta nota.
+        Elimina la nota de ensamble, revirtiendo todos los cambios de stock
+        y limpiando los registros de movimientos en reportes.
         """
         nota = self.get_object()
 
@@ -387,11 +388,17 @@ class NotaEnsambleViewSet(viewsets.ModelViewSet):
         if TrasladoProducto.objects.filter(detalle__nota=nota).exists():
             raise ValidationError({"detail": "No se puede eliminar: tiene historial de traslados."})
 
-        # Revertir stock antes de borrar, dejando una traza en el historial
-        obs_del = f"Eliminación nota #{nota.id}"
-        self._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"), observacion_p=obs_del)
-        self._aplicar_insumos_manuales(nota, signo=Decimal("-1"), observacion_p=obs_del)
+        # 1. Eliminar registros de movimientos de reportes
+        # Estos tienen on_delete=SET_NULL, así que debemos eliminarlos explícitamente
+        InsumoMovimiento.objects.filter(nota_ensamble=nota).delete()
+        ProductoTerminadoMovimiento.objects.filter(nota_ensamble=nota).delete()
 
+        # 2. Revertir stock usando InventoryService
+        obs_del = f"Eliminación nota #{nota.id}"
+        InventoryService._aplicar_detalles(nota, list(nota.detalles.all()), signo=Decimal("-1"), observacion_p=obs_del)
+        InventoryService._aplicar_insumos_manuales(nota, signo=Decimal("-1"), observacion_p=obs_del)
+
+        # 3. Eliminar la nota (CASCADE eliminará detalles e insumos relacionados)
         return super().destroy(request, *args, **kwargs)
   
 
